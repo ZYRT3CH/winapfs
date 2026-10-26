@@ -19,9 +19,11 @@ pub mod gpt;
 pub mod nx;
 pub mod obj;
 pub mod omap;
+pub mod spaceman;
+pub mod write;
 
 pub use bytes::format_uuid;
-pub use dev::{BlockDevice, FileDevice};
+pub use dev::{BlockDevice, FileDevice, ImageFile, WriteDevice};
 pub use error::{Error, Result};
 pub use fs::{DirEntry, Extent, FileKind, Inode, Volume};
 pub use nx::Container;

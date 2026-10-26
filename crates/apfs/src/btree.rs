@@ -151,7 +151,24 @@ pub fn scan(
     window: &dyn Fn(&[u8]) -> Result<Ordering>,
     f: &mut dyn FnMut(&[u8], &[u8]) -> Result<bool>,
 ) -> Result<()> {
-    scan_node(src, root, info, resolve, window, f).map(|_| ())
+    let mut live = |k: &[u8], v: Option<&[u8]>| match v {
+        Some(v) => f(k, v),
+        None => Ok(true),
+    };
+    scan_node(src, root, info, resolve, window, &mut live).map(|_| ())
+}
+
+/// [`scan`] including ghost entries (keys without a value), which some
+/// trees use deliberately: in a space-manager free queue a ghost means a
+/// count of one.
+pub fn scan_with_ghosts(
+    src: &dyn NodeSource,
+    root: &Node,
+    info: &BTreeInfo,
+    resolve: Resolve,
+    f: &mut dyn FnMut(&[u8], Option<&[u8]>) -> Result<bool>,
+) -> Result<()> {
+    scan_node(src, root, info, resolve, &|_| Ok(Ordering::Equal), f).map(|_| ())
 }
 
 fn scan_node(
@@ -160,7 +177,7 @@ fn scan_node(
     info: &BTreeInfo,
     resolve: Resolve,
     window: &dyn Fn(&[u8]) -> Result<Ordering>,
-    f: &mut dyn FnMut(&[u8], &[u8]) -> Result<bool>,
+    f: &mut dyn FnMut(&[u8], Option<&[u8]>) -> Result<bool>,
 ) -> Result<bool> {
     let n = node.nkeys as usize;
     if node.is_leaf() {
@@ -170,10 +187,8 @@ fn scan_node(
                 Ordering::Less => {}
                 Ordering::Greater => return Ok(false),
                 Ordering::Equal => {
-                    if let Some(v) = v {
-                        if !f(k, v)? {
-                            return Ok(false);
-                        }
+                    if !f(k, v)? {
+                        return Ok(false);
                     }
                 }
             }

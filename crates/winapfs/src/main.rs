@@ -6,6 +6,7 @@ mod automount;
 mod backends;
 #[cfg(windows)]
 mod disks;
+mod dump;
 #[cfg(windows)]
 mod mountfs;
 #[cfg(windows)]
@@ -273,6 +274,20 @@ fn run(a: &Args) -> CliResult {
         "cat" => {
             need(2)?;
             cmd_cat(&a.pos[0], &a.pos[1], a.vol, a.part)
+        }
+        "dump" => {
+            need(1)?;
+            dump::dump(&a.pos[0], a.part)
+        }
+        // Developer commands for write support; image files only.
+        "dev-commit" => {
+            need(1)?;
+            let n: u32 = a.pos.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
+            let mut w = apfs::write::Writer::open(Path::new(&a.pos[0]))?;
+            for _ in 0..n {
+                println!("committed xid {}", w.commit_empty()?);
+            }
+            Ok(())
         }
         other => Err(CliError::new(format!("unknown command `{other}`")).hint(USAGE)),
     }

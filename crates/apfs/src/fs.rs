@@ -285,6 +285,16 @@ impl<'c> Volume<'c> {
         Ok(out)
     }
 
+    /// The volume object map's entries as (oid, xid, value).
+    pub fn omap_entries(&self) -> Result<Vec<(u64, u64, crate::omap::OmapVal)>> {
+        self.omap.entries(&self.c.r)
+    }
+
+    /// The file-system tree's root node.
+    pub fn fs_root(&self) -> &Node {
+        &self.root
+    }
+
     pub fn xattr(&self, id: u64, name: &str) -> Result<Option<Xattr>> {
         Ok(self.xattrs(id)?.into_iter().find(|x| x.name == name))
     }

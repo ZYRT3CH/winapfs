@@ -98,12 +98,21 @@ pub struct NxSuperblock {
     pub xp_data_blocks: u32,
     pub xp_desc_base: u64,
     pub xp_data_base: u64,
+    pub xp_desc_next: u32,
+    pub xp_data_next: u32,
     pub xp_desc_index: u32,
     pub xp_desc_len: u32,
+    pub xp_data_index: u32,
+    pub xp_data_len: u32,
     pub spaceman_oid: u64,
     pub omap_oid: u64,
     pub reaper_oid: u64,
+    pub max_file_systems: u32,
     pub fs_oids: Vec<u64>,
+    pub flags: u64,
+    pub ephemeral_info: [u64; 4],
+    /// The whole block, so a rewrite keeps fields this crate does not model.
+    pub raw: Vec<u8>,
 }
 
 impl NxSuperblock {
@@ -127,12 +136,20 @@ impl NxSuperblock {
             xp_data_blocks: u32_at(b, 108)?,
             xp_desc_base: u64_at(b, 112)?,
             xp_data_base: u64_at(b, 120)?,
+            xp_desc_next: u32_at(b, 128)?,
+            xp_data_next: u32_at(b, 132)?,
             xp_desc_index: u32_at(b, 136)?,
             xp_desc_len: u32_at(b, 140)?,
+            xp_data_index: u32_at(b, 144)?,
+            xp_data_len: u32_at(b, 148)?,
             spaceman_oid: u64_at(b, 152)?,
             omap_oid: u64_at(b, 160)?,
             reaper_oid: u64_at(b, 168)?,
+            max_file_systems: u32_at(b, 180)?,
             fs_oids: fs_oids.into_iter().filter(|&o| o != 0).collect(),
+            flags: u64_at(b, 1264)?,
+            ephemeral_info: [u64_at(b, 1312)?, u64_at(b, 1320)?, u64_at(b, 1328)?, u64_at(b, 1336)?],
+            raw: b.to_vec(),
         })
     }
 }
@@ -176,6 +193,8 @@ pub struct ApfsSuperblock {
     pub last_modified_by: String,
     pub name: String,
     pub role: u16,
+    /// The whole block, so a rewrite keeps fields this crate does not model.
+    pub raw: Vec<u8>,
 }
 
 impl ApfsSuperblock {
@@ -211,6 +230,7 @@ impl ApfsSuperblock {
             last_modified_by: cstr(slice_at(b, 320, 32)?),
             name: cstr(slice_at(b, 704, 256)?),
             role: u16_at(b, 964)?,
+            raw: b.to_vec(),
         })
     }
 
@@ -287,6 +307,59 @@ impl Container {
 
     pub fn block_size(&self) -> u32 {
         self.r.block_size
+    }
+
+    /// Any block, unchecked (block 0 included). For inspection tools.
+    pub fn raw_block(&self, paddr: u64) -> Result<Vec<u8>> {
+        if paddr >= self.r.block_count {
+            return Err(corrupt(format!("block address {paddr:#x} outside the container")));
+        }
+        let mut b = vec![0u8; self.r.block_size as usize];
+        self.r.read_at(paddr * self.r.block_size as u64, &mut b)?;
+        Ok(b)
+    }
+
+    /// Reads an ephemeral object of the mounted checkpoint (it may span
+    /// several blocks of the checkpoint data ring) and verifies its checksum.
+    pub fn ephemeral(&self, oid: u64) -> Result<Vec<u8>> {
+        let m = self
+            .checkpoint_map
+            .iter()
+            .find(|m| m.oid == oid)
+            .ok_or_else(|| corrupt(format!("ephemeral object {oid:#x} is not in the checkpoint map")))?;
+        let bs = self.r.block_size as u64;
+        let blocks = (m.size as u64).div_ceil(bs);
+        let ring = (self.sb.xp_data_blocks & 0x7fff_ffff) as u64;
+        let mut out = Vec::with_capacity((blocks * bs) as usize);
+        for i in 0..blocks {
+            // The data area is a ring: an object may wrap from its end back to its start.
+            let offset = (m.paddr - self.sb.xp_data_base + i) % ring.max(1);
+            out.extend(self.raw_block(self.sb.xp_data_base + offset)?);
+        }
+        out.truncate(m.size as usize);
+        if !checksum::verify(&out) {
+            return Err(corrupt(format!("checksum mismatch in ephemeral object {oid:#x}")));
+        }
+        Ok(out)
+    }
+
+    /// Physical address of an ephemeral object in the mounted checkpoint.
+    pub fn ephemeral_paddr(&self, oid: u64) -> Option<u64> {
+        self.checkpoint_map.iter().find(|m| m.oid == oid).map(|m| m.paddr)
+    }
+
+    pub fn space_manager(&self) -> Result<crate::spaceman::Spaceman> {
+        crate::spaceman::Spaceman::parse(&self.ephemeral(self.sb.spaceman_oid)?)
+    }
+
+    /// The container object map's entries as (oid, xid, value).
+    pub fn omap_entries(&self) -> Result<Vec<(u64, u64, crate::omap::OmapVal)>> {
+        self.omap.entries(&self.r)
+    }
+
+    /// Reads and checksum-verifies a B-tree node.
+    pub fn node(&self, paddr: u64) -> Result<Arc<Node>> {
+        self.r.read_node(paddr)
     }
 
     /// B-tree nodes read from disk so far (cache misses).
