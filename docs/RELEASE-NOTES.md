@@ -3,7 +3,7 @@
 ### How to install
 
 1. Download **`winapfs.exe`** below.
-2. Double-click it. It installs WinFsp if needed and asks Windows for permission once. Click **Yes**.
+2. Double-click it. It installs WinFsp if needed, then asks Windows for permission. Click **Yes**.
 3. Plug in your Mac drive. After a few seconds it appears in File Explorer, usually as **M:**.
 
 If Windows says *"Windows protected your PC"*, click **More info**, then **Run anyway**.

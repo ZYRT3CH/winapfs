@@ -21,7 +21,7 @@ Go to the [latest release](https://github.com/ZYRT3CH/winapfs/releases/latest) a
 A window opens and does the setup for you:
 
 - If your PC does not have **WinFsp** yet, it asks to install it. WinFsp is a free helper program that lets winapfs show up as a drive. Press **Enter** to say yes.
-- Windows asks: *"Do you want to allow this app to make changes to your device?"* Click **Yes**. It asks only this once.
+- Windows asks: *"Do you want to allow this app to make changes to your device?"* Click **Yes**. If WinFsp is being installed, you will see this question twice: once for WinFsp and once for winapfs.
 - When the window says **Done**, press **Enter** to close it.
 
 > **Windows may warn you first.** You might see *"Windows protected your PC"*. That happens with new programs that are not yet widely known. Click **More info**, then **Run anyway**.
@@ -42,7 +42,7 @@ That's it. From now on this happens by itself, even after you restart your PC.
 | Unplug it | Close any files you have open from it, then unplug. |
 | Hide the drive without unplugging | Run `winapfs unmount M:` in a terminal |
 | Show it again | Unplug the drive and plug it back in, or run `winapfs mount auto M:` |
-| Copy everything to your PC | Copy the folders in File Explorer, or run `winapfs get auto / D:\MacCopy` |
+| Copy files to your PC | Copy them in File Explorer, like from any other drive |
 
 ## Remove winapfs
 
