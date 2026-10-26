@@ -17,6 +17,7 @@ pub mod dev;
 pub mod error;
 pub mod fs;
 pub mod gpt;
+pub mod name_hash;
 pub mod nx;
 pub mod obj;
 pub mod omap;

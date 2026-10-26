@@ -317,6 +317,67 @@ pub fn rebuild_nodes(src: &str) -> CliResult {
     Ok(())
 }
 
+/// `winapfs dev-hash-check <source>`: recomputes the stored name hash of
+/// every directory entry and checks how entries are ordered, to validate the
+/// hash and ordering that writes must reproduce.
+pub fn hash_check(src: &str, vol: usize, part: Option<u32>) -> CliResult {
+    use apfs::name_hash::name_len_and_hash;
+    let (c, _) = open_source(src, part)?;
+    let v = c.volume(vol)?;
+    let ci = v.sb.is_case_insensitive();
+    let (mut total, mut ok, mut by_hash_ok, mut by_name_ok, mut pairs) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut bad: Vec<String> = Vec::new();
+    let mut prev: Option<(u64, u32, Vec<u8>)> = None;
+    v.scan_all(&mut |k, _| {
+        let hdr = u64::from_le_bytes(k[0..8].try_into().unwrap());
+        if hdr >> 60 != 9 || k.len() < 12 {
+            return Ok(true);
+        }
+        let id = hdr & 0x0fff_ffff_ffff_ffff;
+        let stored = u32::from_le_bytes(k[8..12].try_into().unwrap());
+        let raw = &k[12..];
+        let name = String::from_utf8_lossy(&raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())]).into_owned();
+        total += 1;
+        let ours = name_len_and_hash(&name, ci);
+        if ours == stored {
+            ok += 1;
+        } else if bad.len() < 15 {
+            bad.push(format!("  {name:?}: stored {:#08x} (len {}), ours {:#08x}", stored >> 10, stored & 0x3ff, ours >> 10));
+        }
+        if let Some((pid, ph, pn)) = &prev {
+            if *pid == id {
+                pairs += 1;
+                by_hash_ok += (*ph <= stored) as u64;
+                by_name_ok += (pn.as_slice() <= raw) as u64;
+            }
+        }
+        prev = Some((id, stored, raw.to_vec()));
+        Ok(true)
+    })?;
+    println!("directory entries {total}: hash matches {ok}, mismatches {}", total - ok);
+    for b in &bad {
+        println!("{b}");
+    }
+    println!("ordering within folders ({pairs} neighbouring pairs): by hash field {by_hash_ok}, by name bytes {by_name_ok}");
+    Ok(())
+}
+
+/// `winapfs dev-records <source> <id> [--vol N]`: prints the raw records of
+/// one file-system object, to copy real implementations' field choices.
+pub fn records(src: &str, id: u64, vol: usize, part: Option<u32>) -> CliResult {
+    let (c, _) = open_source(src, part)?;
+    let v = c.volume(vol)?;
+    v.scan_all(&mut |k, val| {
+        let hdr = u64::from_le_bytes(k[0..8].try_into().unwrap());
+        if hdr & 0x0fff_ffff_ffff_ffff == id {
+            println!("type {:2}  key {}  ({} bytes)", hdr >> 60, hex(&k[8..]), k.len());
+            println!("         val {}  ({} bytes)", hex(val), val.len());
+        }
+        Ok(true)
+    })?;
+    Ok(())
+}
+
 struct NodeReader<'a>(&'a Container);
 
 impl NodeSource for NodeReader<'_> {

@@ -8,6 +8,7 @@
 //! written the previous checkpoint stays the newest valid one, so a crash
 //! mid-transaction loses the transaction, not the container.
 
+mod fs;
 mod space;
 
 use std::collections::HashMap;
@@ -136,6 +137,105 @@ impl Writer {
         let omap = self.omap_set(&mut t, self.c.sb.omap_oid, oid, new)?;
         t.nx_omap_oid = Some(omap);
         self.commit(t)
+    }
+
+    /// Creates an empty regular file `name` in folder `dir_id` of volume
+    /// `vol`; returns the new inode number.
+    pub fn create_file(&mut self, vol: usize, dir_id: u64, name: &str) -> Result<(u64, u64)> {
+        if name.is_empty() || name.len() > 255 || name.contains(['/', '\0']) {
+            return Err(unsupported(format!("the file name {name:?}")));
+        }
+        let mut t = self.begin()?;
+        let now = now_ns();
+        let v = self.c.volume(vol)?;
+        let ci = v.sb.is_case_insensitive();
+        let want = v.name_key(name);
+        if v.read_dir(dir_id)?.iter().any(|e| v.name_key(&e.name) == want) {
+            return Err(unsupported(format!("{name:?} already exists")));
+        }
+        let vol_oid = v.sb.hdr.oid;
+        let mut apsb = v.sb.raw.clone();
+        let id = u64_at(&apsb, 176)?; // apfs_next_obj_id
+
+        let root = v.fs_root();
+        if !root.is_leaf() {
+            return Err(unsupported("file-system trees deeper than one node (coming next)"));
+        }
+        let info = root.info()?;
+        let mut entries = root.all_entries(&info)?;
+
+        // The parent folder: one more child, and its times move.
+        let parent_key = fs::inode_key(dir_id);
+        let parent = entries
+            .iter_mut()
+            .find(|(k, _)| *k == parent_key)
+            .and_then(|(_, v)| v.as_mut())
+            .ok_or_else(|| corrupt(format!("folder {dir_id} not found")))?;
+        let children = i32::from_le_bytes(parent[56..60].try_into().unwrap());
+        parent[56..60].copy_from_slice(&(children + 1).to_le_bytes());
+        put_u64(parent, 24, now); // mod_time
+        put_u64(parent, 32, now); // change_time
+
+        fs::insert(&mut entries, fs::inode_key(id), fs::new_file_inode(dir_id, id, name, now));
+        fs::insert(&mut entries, fs::drec_key(dir_id, name, ci), fs::drec_val(id, now, fs::DT_REG));
+
+        let old_root = self.vol_omap_lookup(&v, root.hdr.oid)?;
+        let new_root = t.space.alloc(&self.c)?;
+        let longest_key = entries.iter().map(|(k, _)| k.len() as u32).max().unwrap_or(0);
+        let longest_val = entries.iter().map(|(_, v)| v.as_ref().map_or(0, |v| v.len()) as u32).max().unwrap_or(0);
+        let info = BTreeInfo {
+            key_count: entries.len() as u64,
+            longest_key: info.longest_key.max(longest_key),
+            longest_val: info.longest_val.max(longest_val),
+            ..info
+        };
+        let nb = NodeBuild {
+            oid: root.hdr.oid, // virtual: keeps its id, gets a new address via the object map
+            xid: t.xid,
+            obj_type: root.hdr.obj_type,
+            subtype: root.hdr.subtype,
+            level: 0,
+            root: true,
+            fixed: None,
+            info,
+            entries: &entries,
+        };
+        if !fits(&nb, self.c.block_size() as usize) {
+            return Err(unsupported("file-system trees that outgrow one node (coming next)"));
+        }
+        t.writes.push((new_root, build(&nb, self.c.block_size() as usize)?));
+        t.space.free(old_root);
+        let vol_omap = self.omap_set(&mut t, v.sb.omap_oid, root.hdr.oid, new_root)?;
+
+        // Volume superblock: new object map, one more file, next id, history.
+        put_u64(&mut apsb, 128, vol_omap);
+        put_u64(&mut apsb, 176, id + 1);
+        put_u64(&mut apsb, 184, v.sb.num_files + 1);
+        // fs tree node + object map node + object map: three in, three out.
+        let alloced = u64_at(&apsb, 224)?;
+        let freed = u64_at(&apsb, 232)?;
+        put_u64(&mut apsb, 224, alloced + 3);
+        put_u64(&mut apsb, 232, freed + 3);
+        stamp_modified_by(&mut apsb, t.xid);
+        set_xid(&mut apsb, t.xid);
+        seal(&mut apsb);
+        let old_apsb = self.c.omap_lookup(vol_oid)?;
+        let new_apsb = t.space.alloc(&self.c)?;
+        t.writes.push((new_apsb, apsb));
+        t.space.free(old_apsb);
+        let omap = self.omap_set(&mut t, self.c.sb.omap_oid, vol_oid, new_apsb)?;
+        t.nx_omap_oid = Some(omap);
+        let xid = self.commit(t)?;
+        Ok((id, xid))
+    }
+
+    fn vol_omap_lookup(&self, v: &crate::fs::Volume, oid: u64) -> Result<u64> {
+        v.omap_entries()?
+            .into_iter()
+            .filter(|(o, x, _)| *o == oid && *x <= self.c.xid())
+            .max_by_key(|(_, x, _)| *x)
+            .map(|(_, _, val)| val.paddr)
+            .ok_or_else(|| corrupt(format!("object {oid:#x} missing from the volume object map")))
     }
 
     /// Points `oid` at `paddr` (as of this transaction) in the object map at

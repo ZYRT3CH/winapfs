@@ -451,7 +451,7 @@ impl<'c> Volume<'c> {
     }
 
     /// Visits every record in the file-system tree, in key order.
-    pub(crate) fn scan_all(&self, f: &mut dyn FnMut(&[u8], &[u8]) -> Result<bool>) -> Result<()> {
+    pub fn scan_all(&self, f: &mut dyn FnMut(&[u8], &[u8]) -> Result<bool>) -> Result<()> {
         let resolve = |oid: u64| resolve(self.c, &self.omap, oid);
         btree::scan(&self.c.r, &self.root, &self.root_info, &resolve, &|_| Ok(Ordering::Equal), f)
     }

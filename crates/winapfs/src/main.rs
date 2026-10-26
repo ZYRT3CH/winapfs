@@ -279,6 +279,16 @@ fn run(a: &Args) -> CliResult {
             need(1)?;
             dump::dump(&a.pos[0], a.part)
         }
+        "dev-records" => {
+            need(2)?;
+            let id = u64::from_str_radix(a.pos[1].trim_start_matches("0x"), if a.pos[1].starts_with("0x") { 16 } else { 10 })
+                .map_err(|_| CliError::new("id must be a number"))?;
+            dump::records(&a.pos[0], id, a.vol, a.part)
+        }
+        "dev-hash-check" => {
+            need(1)?;
+            dump::hash_check(&a.pos[0], a.vol, a.part)
+        }
         "dev-rebuild-nodes" => {
             need(1)?;
             dump::rebuild_nodes(&a.pos[0])
@@ -290,6 +300,15 @@ fn run(a: &Args) -> CliResult {
             let mut w = apfs::write::Writer::open(Path::new(&a.pos[0]))?;
             for _ in 0..n {
                 println!("committed xid {}", w.commit_empty()?);
+            }
+            Ok(())
+        }
+        "dev-touch" => {
+            need(2)?;
+            let mut w = apfs::write::Writer::open(Path::new(&a.pos[0]))?;
+            for name in &a.pos[1..] {
+                let (id, xid) = w.create_file(a.vol, 2, name)?;
+                println!("created {name:?} as inode {id} in xid {xid}");
             }
             Ok(())
         }
