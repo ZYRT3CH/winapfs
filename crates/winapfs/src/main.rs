@@ -22,6 +22,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use apfs::check::{check_volume, CheckOptions};
+use apfs::write::NewKind;
 use apfs::{format_uuid, gpt, Container, FileDevice, FileKind, Inode, Volume};
 
 const USAGE: &str = r"winapfs - read Mac (APFS) drives on Windows.
@@ -303,12 +304,36 @@ fn run(a: &Args) -> CliResult {
             }
             Ok(())
         }
-        "dev-touch" => {
+        "dev-touch" | "dev-mkdir" => {
             need(2)?;
+            let kind = if a.cmd == "dev-mkdir" { NewKind::Folder } else { NewKind::File };
             let mut w = apfs::write::Writer::open(Path::new(&a.pos[0]))?;
-            for name in &a.pos[1..] {
-                let (id, xid) = w.create_file(a.vol, 2, name)?;
-                println!("created {name:?} as inode {id} in xid {xid}");
+            for path in &a.pos[1..] {
+                let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+                let dir_id = w.container().volume(a.vol)?.lookup_path(dir)?.id;
+                let (id, xid) = w.create(a.vol, dir_id, name, kind)?;
+                println!("created {path:?} as inode {id} in xid {xid}");
+            }
+            Ok(())
+        }
+        // dev-fill <image> <count> [folder] [per-transaction]: makes files f000001...
+        "dev-fill" => {
+            need(2)?;
+            let count: u32 = a.pos[1].parse().map_err(|_| CliError::new("count must be a number"))?;
+            let dir = a.pos.get(2).map_or("", String::as_str);
+            let batch: u32 = a.pos.get(3).and_then(|s| s.parse().ok()).unwrap_or(1).max(1);
+            let mut w = apfs::write::Writer::open(Path::new(&a.pos[0]))?;
+            let dir_id = w.container().volume(a.vol)?.lookup_path(dir)?.id;
+            let mut done = 0;
+            while done < count {
+                let n = batch.min(count - done);
+                let names: Vec<String> = (done..done + n).map(|i| format!("f{:06}", i + 1)).collect();
+                let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                let (_, xid) = w.create_many(a.vol, dir_id, &refs, NewKind::File)?;
+                done += n;
+                if done % 500 == 0 || done == count {
+                    println!("{done} files, xid {xid}");
+                }
             }
             Ok(())
         }

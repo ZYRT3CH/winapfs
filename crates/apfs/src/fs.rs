@@ -450,6 +450,12 @@ impl<'c> Volume<'c> {
         Ok(len as usize)
     }
 
+    /// A file-system tree node by object id, and the block it was read from.
+    pub(crate) fn fs_node(&self, oid: u64) -> Result<(Arc<Node>, u64)> {
+        let paddr = resolve(self.c, &self.omap, oid)?;
+        Ok((self.c.r.read_node(paddr)?, paddr))
+    }
+
     /// Visits every record in the file-system tree, in key order.
     pub fn scan_all(&self, f: &mut dyn FnMut(&[u8], &[u8]) -> Result<bool>) -> Result<()> {
         let resolve = |oid: u64| resolve(self.c, &self.omap, oid);
