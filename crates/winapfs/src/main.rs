@@ -316,6 +316,28 @@ fn run(a: &Args) -> CliResult {
             }
             Ok(())
         }
+        // dev-put <image> <local file> <path in image>: creates or replaces a file.
+        "dev-put" => {
+            need(3)?;
+            let src = File::open(&a.pos[1])?;
+            let len = src.metadata()?.len();
+            let dest = a.pos[2].trim_end_matches('/');
+            let mut w = apfs::write::Writer::open(Path::new(&a.pos[0]))?;
+            let existing = w.container().volume(a.vol)?.lookup_path(dest).ok().map(|i| i.id);
+            let id = match existing {
+                Some(id) => id,
+                None => {
+                    let (dir, name) = dest.rsplit_once('/').unwrap_or(("", dest));
+                    let dir_id = w.container().volume(a.vol)?.lookup_path(dir)?.id;
+                    w.create(a.vol, dir_id, name, NewKind::File)?.0
+                }
+            };
+            let start = Instant::now();
+            let xid = w.write_file(a.vol, id, &mut io::BufReader::new(src), len)?;
+            let secs = start.elapsed().as_secs_f64().max(1e-6);
+            println!("wrote {len} bytes to {dest:?} (inode {id}) in xid {xid}, {:.1} MB/s", len as f64 / secs / 1e6);
+            Ok(())
+        }
         // dev-fill <image> <count> [folder] [per-transaction]: makes files f000001...
         "dev-fill" => {
             need(2)?;

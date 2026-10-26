@@ -49,6 +49,8 @@ pub struct Space {
     ip_dirty: bool,
     fq: [Vec<FqEntry>; 2],
     fq_roots: [Option<(u32, BTreeInfo)>; 2],
+    /// Chunk where the last run was found; earlier ones were full.
+    run_hint: usize,
 }
 
 impl Space {
@@ -111,6 +113,7 @@ impl Space {
             ip_dirty: false,
             fq,
             fq_roots,
+            run_hint: 0,
         })
     }
 
@@ -184,9 +187,45 @@ impl Space {
         Err(Error::Unsupported("the container is full".into()))
     }
 
+    /// Allocates up to `max` contiguous main-device blocks: the first free
+    /// run, cut at `max` or at the end of its chunk. Returns (first block,
+    /// count).
+    pub fn alloc_run(&mut self, c: &Container, max: u64) -> Result<(u64, u64)> {
+        let bpc = self.sm.blocks_per_chunk as u64;
+        let used = |bm: &[u8], i: usize| bm[i / 8] >> (i % 8) & 1 == 1;
+        for ch in self.run_hint..self.chunk_count() {
+            if self.chunk_free(ch) == 0 {
+                continue;
+            }
+            let blocks = self.chunk_blocks(ch) as usize;
+            let bm = self.bitmap(c, ch)?;
+            let mut i = 0;
+            while i < blocks && used(bm, i) {
+                i = if i % 8 == 0 && bm[i / 8] == 0xff { i + 8 } else { i + 1 };
+            }
+            if i >= blocks {
+                continue;
+            }
+            let mut j = i;
+            while j < blocks && ((j - i) as u64) < max && !used(bm, j) {
+                bm[j / 8] |= 1 << (j % 8);
+                j += 1;
+            }
+            self.add_chunk_free(ch, -((j - i) as i64));
+            self.run_hint = ch;
+            return Ok((ch as u64 * bpc + i as u64, (j - i) as u64));
+        }
+        Err(Error::Unsupported("the container is full".into()))
+    }
+
     /// Queues a main-device block for freeing.
     pub fn free(&mut self, paddr: u64) {
-        self.fq[SFQ_MAIN].push(FqEntry { xid: self.xid, paddr, count: 1 });
+        self.free_run(paddr, 1);
+    }
+
+    /// Queues `count` main-device blocks from `paddr` for freeing.
+    pub fn free_run(&mut self, paddr: u64, count: u64) {
+        self.fq[SFQ_MAIN].push(FqEntry { xid: self.xid, paddr, count });
     }
 
     fn ip_alloc(&mut self) -> Result<u64> {

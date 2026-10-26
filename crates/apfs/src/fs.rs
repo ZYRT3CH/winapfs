@@ -450,6 +450,10 @@ impl<'c> Volume<'c> {
         Ok(len as usize)
     }
 
+    pub(crate) fn container(&self) -> &'c Container {
+        self.c
+    }
+
     /// A file-system tree node by object id, and the block it was read from.
     pub(crate) fn fs_node(&self, oid: u64) -> Result<(Arc<Node>, u64)> {
         let paddr = resolve(self.c, &self.omap, oid)?;

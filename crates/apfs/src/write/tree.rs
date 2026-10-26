@@ -162,6 +162,38 @@ impl Tree {
         }))
     }
 
+    /// The entry with the greatest key `<= key`.
+    pub fn floor(&mut self, rd: &dyn Reader, key: &[u8]) -> Result<Option<Entry>> {
+        let path = self.path(rd, key)?;
+        let leaf = path.last().unwrap().0;
+        let i = self.nodes[leaf].keys.partition_point(|k| (self.cmp)(k, key) != Ordering::Greater);
+        if i > 0 {
+            return Ok(Some(self.leaf_entry(leaf, i - 1)));
+        }
+        // An index key can be lower than its child's first key (after that
+        // key was removed); then the answer is the last entry to the left.
+        for &(n, ci) in path[..path.len() - 1].iter().rev() {
+            if ci > 0 && (self.cmp)(&self.nodes[n].keys[ci], key) != Ordering::Greater {
+                let mut m = self.child(rd, n, ci - 1)?;
+                while self.nodes[m].level > 0 {
+                    let last = self.nodes[m].keys.len() - 1;
+                    m = self.child(rd, m, last)?;
+                }
+                let len = self.nodes[m].keys.len();
+                return Ok((len > 0).then(|| self.leaf_entry(m, len - 1)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn leaf_entry(&self, n: usize, i: usize) -> Entry {
+        let v = match &self.nodes[n].vals[i] {
+            Val::Leaf(v) => v.clone(),
+            Val::Child(_) => None,
+        };
+        (self.nodes[n].keys[i].clone(), v)
+    }
+
     /// Every leaf entry with `lo <= key < hi`, in order.
     pub fn range(&mut self, rd: &dyn Reader, lo: &[u8], hi: &[u8]) -> Result<Vec<Entry>> {
         let mut out = Vec::new();

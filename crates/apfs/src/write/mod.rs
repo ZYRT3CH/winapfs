@@ -13,12 +13,13 @@ mod space;
 mod tree;
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::btree::Node;
 use crate::btree_write::Entry;
-use crate::bytes::u64_at;
+use crate::bytes::{u32_at, u64_at};
 use crate::checksum;
 use crate::dev::{FileDevice, ImageFile, WriteDevice};
 use crate::error::{corrupt, unsupported, Error, Result};
@@ -171,14 +172,26 @@ impl Writer {
         Ok((ids, self.commit(t)?))
     }
 
-    /// Writes a volume's changes: its file-system tree, its object map and a
-    /// new copy of its superblock.
+    /// Replaces the contents of file `id` with `len` bytes read from `src`;
+    /// returns the transaction id.
+    pub fn write_file(&mut self, vol: usize, id: u64, src: &mut dyn Read, len: u64) -> Result<u64> {
+        let mut t = self.begin()?;
+        let v = self.c.volume(vol)?;
+        let mut e = VolEdit::open(&v)?;
+        e.set_data(&mut t, &self.dev, id, src, len, now_ns())?;
+        self.finish_volume(&mut t, e)?;
+        drop(v);
+        self.commit(t)
+    }
+
+    /// Writes a volume's changes: its file-system and extent-reference trees,
+    /// its object map and a new copy of its superblock.
     fn finish_volume(&self, t: &mut Txn, e: VolEdit) -> Result<()> {
         if t.nx_omap_oid.is_some() {
             return Err(unsupported("changing two volumes in one transaction"));
         }
-        let VolEdit { v, tree, mut apsb } = e;
-        let (mut alloced, mut freed) = (0, 0);
+        let VolEdit { v, tree, extref, mut apsb, data_alloced, data_freed } = e;
+        let (mut alloced, mut freed) = (data_alloced, data_freed);
         if tree.changed() {
             let f = tree.flush(&self.c, &mut t.space, &mut t.writes, t.xid, &mut t.next_oid)?;
             if f.root != v.sb.root_tree_oid {
@@ -189,7 +202,14 @@ impl Writer {
             alloced += f.allocated + a;
             freed += f.freed + fr;
         }
-        // Blocks the volume uses (its trees and object map), and running totals.
+        if let Some(x) = extref.filter(Tree::changed) {
+            let mut no_oids = 0;
+            let f = x.flush(&self.c, &mut t.space, &mut t.writes, t.xid, &mut no_oids)?;
+            put_u64(&mut apsb, 144, f.root); // apfs_extentref_tree_oid
+            alloced += f.allocated;
+            freed += f.freed;
+        }
+        // Blocks the volume uses (data, trees, object map), and running totals.
         let (used, total_alloced, total_freed) = (u64_at(&apsb, 88)?, u64_at(&apsb, 224)?, u64_at(&apsb, 232)?);
         put_u64(&mut apsb, 88, used + alloced - freed); // apfs_fs_alloc_count
         put_u64(&mut apsb, 224, total_alloced + alloced); // apfs_total_blocks_alloced
@@ -354,13 +374,23 @@ impl Reader for VolReader<'_, '_> {
     }
 }
 
-/// A volume being changed in a transaction: its file-system tree, edited
-/// copy-on-write, and a copy of its superblock.
+/// A volume being changed in a transaction: its file-system tree and (once
+/// needed) its extent-reference tree, edited copy-on-write, and a copy of
+/// its superblock.
 struct VolEdit<'a, 'c> {
     v: &'a Volume<'c>,
     tree: Tree,
+    extref: Option<Tree>,
     apsb: Vec<u8>,
+    /// File data blocks allocated and freed.
+    data_alloced: u64,
+    data_freed: u64,
 }
+
+/// Longest extent this writes, in blocks (128 MiB with 4 KiB blocks).
+const MAX_EXTENT_BLOCKS: u64 = 32768;
+/// Blocks copied per device write.
+const COPY_BLOCKS: u64 = 256;
 
 impl<'a, 'c> VolEdit<'a, 'c> {
     fn open(v: &'a Volume<'c>) -> Result<Self> {
@@ -368,7 +398,127 @@ impl<'a, 'c> VolEdit<'a, 'c> {
             return Err(unsupported("writing to volumes that have snapshots"));
         }
         let tree = Tree::open(&VolReader(v), v.sb.root_tree_oid, fs::key_cmp)?;
-        Ok(Self { v, tree, apsb: v.sb.raw.clone() })
+        Ok(Self { v, tree, extref: None, apsb: v.sb.raw.clone(), data_alloced: 0, data_freed: 0 })
+    }
+
+    fn extref(&mut self) -> Result<&mut Tree> {
+        if self.extref.is_none() {
+            let rd = PhysReader(self.v.container());
+            self.extref = Some(Tree::open(&rd, self.v.sb.extentref_tree_oid, fs::key_cmp)?);
+        }
+        Ok(self.extref.as_mut().unwrap())
+    }
+
+    fn remove(&mut self, key: &[u8]) -> Result<bool> {
+        self.tree.remove(&VolReader(self.v), key)
+    }
+
+    /// Replaces a file's data with `len` bytes from `src`, written straight
+    /// to newly allocated blocks (free in every checkpoint that can still be
+    /// mounted, so writing them early is safe).
+    fn set_data(&mut self, t: &mut Txn, dev: &ImageFile, id: u64, src: &mut dyn Read, len: u64, now: u64) -> Result<()> {
+        let c = self.v.container();
+        let bs = c.block_size() as u64;
+        let key = fs::inode_key(id);
+        let inode = self.get(&key)?.ok_or_else(|| Error::NotFound(format!("inode {id}")))?;
+        if !fs::is_regular(&inode) {
+            return Err(unsupported("writing data to something other than a regular file"));
+        }
+        let (mut fixed, mut fields) = fs::split_inode(&inode)?;
+        if u32_at(&fixed, 68)? & fs::UF_COMPRESSED != 0 {
+            return Err(unsupported("rewriting compressed files"));
+        }
+        let stream = u64_at(&fixed, 8)?; // private_id
+        let old = fields.iter().find(|f| f.0 == fs::INO_EXT_TYPE_DSTREAM).map(|f| f.2.clone());
+        self.drop_data(t, stream)?;
+
+        let mut logical = 0;
+        let mut buf = Vec::new();
+        while logical < len {
+            let want = (len - logical).div_ceil(bs).min(MAX_EXTENT_BLOCKS);
+            let (start, n) = t.space.alloc_run(c, want)?;
+            if start == 0 || start + n > c.sb.block_count {
+                return Err(corrupt(format!("allocator returned blocks outside the container: {start:#x}+{n}")));
+            }
+            let mut done = 0;
+            while done < n {
+                let k = (n - done).min(COPY_BLOCKS);
+                let bytes = (len - logical - done * bs).min(k * bs) as usize;
+                buf.clear();
+                buf.resize((k * bs) as usize, 0);
+                src.read_exact(&mut buf[..bytes])?;
+                dev.write_at((start + done) * bs, &buf)?;
+                done += k;
+            }
+            self.put(fs::file_extent_key(stream, logical), fs::file_extent_val(n * bs, start))?;
+            self.extref()?.upsert(&PhysReader(c), fs::phys_ext_key(start), Some(fs::phys_ext_val(n, stream, 1)))?;
+            self.data_alloced += n;
+            logical += n * bs;
+        }
+
+        if old.is_some() || len > 0 {
+            if self.get(&fs::dstream_id_key(stream))?.is_none() {
+                self.put(fs::dstream_id_key(stream), fs::dstream_id_val(1))?;
+            }
+            let (written, read) = match &old {
+                Some(d) => (u64_at(d, 24)?, u64_at(d, 32)?),
+                None => (0, 0),
+            };
+            let dstream = fs::dstream(len, logical, written + len, read);
+            fs::set_xfield(&mut fields, fs::INO_EXT_TYPE_DSTREAM, fs::XF_SYSTEM_FIELD, dstream);
+        }
+        fields.retain(|f| f.0 != fs::INO_EXT_TYPE_SPARSE_BYTES);
+        let flags = u64_at(&fixed, 48)? & !fs::INODE_IS_SPARSE;
+        put_u64(&mut fixed, 48, flags);
+        put_u64(&mut fixed, 24, now); // mod_time
+        put_u64(&mut fixed, 32, now); // change_time
+        self.put(key, fs::join_inode(&fixed, &fields))
+    }
+
+    /// Removes a data stream's extents, releasing their blocks.
+    fn drop_data(&mut self, t: &mut Txn, stream: u64) -> Result<()> {
+        let bs = self.v.container().block_size() as u64;
+        let (lo, hi) = fs::file_extent_range(stream);
+        for (k, v) in self.range(&lo, &hi)? {
+            self.remove(&k)?;
+            let v = v.ok_or_else(|| corrupt("file extent without a value"))?;
+            let (len, phys) = (u64_at(&v, 0)? & fs::FILE_EXTENT_LEN_MASK, u64_at(&v, 8)?);
+            if phys != 0 {
+                // (Block 0 marks a hole in a sparse file.)
+                self.release_extent(t, phys, len.div_ceil(bs))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Frees `blocks` blocks from `phys` and takes them out of the
+    /// extent-reference tree, splitting a record that covers more.
+    fn release_extent(&mut self, t: &mut Txn, phys: u64, blocks: u64) -> Result<()> {
+        let rd = PhysReader(self.v.container());
+        let x = self.extref()?;
+        let (k, v) = x
+            .floor(&rd, &fs::phys_ext_key(phys))?
+            .ok_or_else(|| corrupt(format!("no extent reference for block {phys:#x}")))?;
+        let v = v.ok_or_else(|| corrupt("extent reference without a value"))?;
+        let start = fs::key_id(&k);
+        let (rlen, owner, refcnt) = (u64_at(&v, 0)? & fs::PEXT_LEN_MASK, u64_at(&v, 8)?, u32_at(&v, 16)? as i32);
+        if start + rlen < phys + blocks {
+            return Err(corrupt(format!("blocks {phys:#x}+{blocks} are not covered by an extent reference")));
+        }
+        if refcnt != 1 {
+            return Err(unsupported("rewriting data shared with clones or snapshots"));
+        }
+        x.remove(&rd, &k)?;
+        if start < phys {
+            x.upsert(&rd, fs::phys_ext_key(start), Some(fs::phys_ext_val(phys - start, owner, 1)))?;
+        }
+        if phys + blocks < start + rlen {
+            let rest = start + rlen - phys - blocks;
+            x.upsert(&rd, fs::phys_ext_key(phys + blocks), Some(fs::phys_ext_val(rest, owner, 1)))?;
+        }
+        t.space.free_run(phys, blocks);
+        self.data_freed += blocks;
+        Ok(())
     }
 
     fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
