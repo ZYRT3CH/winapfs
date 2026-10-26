@@ -264,6 +264,59 @@ fn dump_free_queues(c: &Container, sm: &Spaceman) -> CliResult {
     Ok(())
 }
 
+/// `winapfs dev-rebuild-nodes <image>`: rebuilds every root B-tree node in
+/// the container from its parsed entries and compares the bytes, to prove the
+/// node writer matches existing nodes exactly.
+pub fn rebuild_nodes(src: &str) -> CliResult {
+    use apfs::btree_write::{build, NodeBuild};
+    let (c, _) = open_source(src, None)?;
+    let (mut same, mut differ) = (0, 0);
+    for paddr in 1..c.sb.block_count {
+        let Ok(raw) = c.raw_block(paddr) else { break };
+        let Ok(h) = ObjHeader::parse(&raw) else { continue };
+        if !matches!(h.kind(), 2 | 3) || !checksum::verify(&raw) {
+            continue;
+        }
+        let node = c.node(paddr)?;
+        if !node.is_root() {
+            continue; // non-root nodes need their tree's info; covered once trees grow
+        }
+        let info = node.info()?;
+        let entries = node.all_entries(&info)?;
+        let fixed = node.is_fixed().then_some((info.key_size as usize, info.val_size as usize));
+        let rebuilt = build(
+            &NodeBuild {
+                oid: h.oid,
+                xid: h.xid,
+                obj_type: h.obj_type,
+                subtype: h.subtype,
+                level: node.level,
+                root: true,
+                fixed,
+                info,
+                entries: &entries,
+            },
+            raw.len(),
+        )?;
+        if rebuilt == raw {
+            same += 1;
+        } else {
+            differ += 1;
+            let first = rebuilt.iter().zip(&raw).position(|(a, b)| a != b).unwrap_or(0);
+            println!(
+                "DIFF  block {paddr:#x} type {:#x} sub {:#x} keys {}: first difference at byte {first} (ours {:02x?}, theirs {:02x?})",
+                h.obj_type,
+                h.subtype,
+                node.nkeys,
+                &rebuilt[first..(first + 8).min(raw.len())],
+                &raw[first..(first + 8).min(raw.len())]
+            );
+        }
+    }
+    println!("rebuilt root nodes: {same} identical, {differ} different");
+    Ok(())
+}
+
 struct NodeReader<'a>(&'a Container);
 
 impl NodeSource for NodeReader<'_> {

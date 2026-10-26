@@ -343,6 +343,14 @@ impl Container {
         Ok(out)
     }
 
+    /// Physical address of the newest version of a container-level virtual object.
+    pub fn omap_lookup(&self, oid: u64) -> Result<u64> {
+        self.omap
+            .lookup(&self.r, oid, self.xid())?
+            .map(|v| v.paddr)
+            .ok_or_else(|| corrupt(format!("object {oid:#x} missing from the container object map")))
+    }
+
     /// Physical address of an ephemeral object in the mounted checkpoint.
     pub fn ephemeral_paddr(&self, oid: u64) -> Option<u64> {
         self.checkpoint_map.iter().find(|m| m.oid == oid).map(|m| m.paddr)

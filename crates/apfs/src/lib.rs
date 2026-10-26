@@ -9,6 +9,7 @@
 
 mod bytes;
 pub mod btree;
+pub mod btree_write;
 pub mod check;
 pub mod checksum;
 pub mod decmpfs;

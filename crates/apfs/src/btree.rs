@@ -124,6 +124,17 @@ impl Node {
         Ok((key, Some(slice_at(&self.data, v_start, v_len)?)))
     }
 
+    /// All entries, ghosts included, as owned key/value pairs.
+    pub fn all_entries(&self, info: &BTreeInfo) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
+        (0..self.nkeys as usize)
+            .map(|i| self.entry(i, info).map(|(k, v)| (k.to_vec(), v.map(<[u8]>::to_vec))))
+            .collect()
+    }
+
+    pub fn is_fixed(&self) -> bool {
+        self.flags & BTNODE_FIXED_KV_SIZE != 0
+    }
+
     fn child(&self, i: usize, info: &BTreeInfo) -> Result<u64> {
         let (_, v) = self.entry(i, info)?;
         let v = v.ok_or_else(|| corrupt(format!("index node {:#x} entry {i} has no child", self.hdr.oid)))?;

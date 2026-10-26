@@ -279,6 +279,10 @@ fn run(a: &Args) -> CliResult {
             need(1)?;
             dump::dump(&a.pos[0], a.part)
         }
+        "dev-rebuild-nodes" => {
+            need(1)?;
+            dump::rebuild_nodes(&a.pos[0])
+        }
         // Developer commands for write support; image files only.
         "dev-commit" => {
             need(1)?;
@@ -287,6 +291,12 @@ fn run(a: &Args) -> CliResult {
             for _ in 0..n {
                 println!("committed xid {}", w.commit_empty()?);
             }
+            Ok(())
+        }
+        "dev-rename" => {
+            need(2)?;
+            let mut w = apfs::write::Writer::open(Path::new(&a.pos[0]))?;
+            println!("committed xid {}", w.rename_volume(a.vol, &a.pos[1])?);
             Ok(())
         }
         other => Err(CliError::new(format!("unknown command `{other}`")).hint(USAGE)),
