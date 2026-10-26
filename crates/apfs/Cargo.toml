@@ -1,0 +1,15 @@
+[package]
+description = "Read access to Apple File System (APFS) containers, written from Apple's published specification"
+name = "winapfs-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+lzfse_rust = "0.2.1"
+miniz_oxide = "0.9.1"
+unicode-normalization = "0.1.26"
+
+[lib]
+name = "apfs"

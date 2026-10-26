@@ -1,0 +1,11 @@
+[package]
+name = "winapfs"
+description = "Open Mac (APFS) drives on Windows, read-only: browse, copy and mount them in File Explorer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+
+[dependencies]
+winapfs-core = { version = "0.1.0", path = "../apfs" }
