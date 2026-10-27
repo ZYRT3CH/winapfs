@@ -1,0 +1,674 @@
+//! `winapfs dump <source>`: prints the structures a write has to change, for
+//! developing and debugging write support. Comparing dumps of the same image
+//! before and after a change by a known-good implementation shows the rules
+//! the APFS reference leaves out.
+
+use apfs::btree::{self, NodeSource};
+use apfs::obj::ObjHeader;
+use apfs::spaceman::{self, Spaceman};
+use apfs::{checksum, format_uuid, Container};
+
+use crate::{open_source, CliError, CliResult};
+
+pub fn dump(src: &str, part: Option<u32>) -> CliResult {
+    let (c, location) = open_source(src, part)?;
+    let sb = &c.sb;
+    println!("== container  {location}");
+    println!(
+        "block_size {}  block_count {}  xid {}  next_xid {}  next_oid {:#x}  uuid {}",
+        sb.block_size,
+        sb.block_count,
+        sb.hdr.xid,
+        sb.next_xid,
+        sb.next_oid,
+        format_uuid(&sb.uuid)
+    );
+    println!(
+        "features {:#x}  ro_compat {:#x}  incompat {:#x}  flags {:#x}  max_fs {}  eph_info {:#x?}",
+        sb.features, sb.ro_compat_features, sb.incompat_features, sb.flags, sb.max_file_systems, sb.ephemeral_info
+    );
+    println!(
+        "xp_desc  base {:#x} blocks {} index {} len {} next {}",
+        sb.xp_desc_base, sb.xp_desc_blocks, sb.xp_desc_index, sb.xp_desc_len, sb.xp_desc_next
+    );
+    println!(
+        "xp_data  base {:#x} blocks {} index {} len {} next {}",
+        sb.xp_data_base, sb.xp_data_blocks, sb.xp_data_index, sb.xp_data_len, sb.xp_data_next
+    );
+    println!(
+        "spaceman_oid {:#x}  omap_oid {:#x}  reaper_oid {:#x}  fs_oids {:x?}",
+        sb.spaceman_oid, sb.omap_oid, sb.reaper_oid, sb.fs_oids
+    );
+    let b0 = c.raw_block(0)?;
+    println!("block 0: xid {}  checksum {}", ObjHeader::parse(&b0)?.xid, ok(checksum::verify(&b0)));
+
+    println!("\n== checkpoint descriptor ring");
+    ring(&c, sb.xp_desc_base, sb.xp_desc_blocks)?;
+    println!("\n== checkpoint data ring");
+    ring(&c, sb.xp_data_base, sb.xp_data_blocks)?;
+    println!("\n== checkpoint map (xid {})", sb.hdr.xid);
+    for m in &c.checkpoint_map {
+        println!(
+            "  type {:#010x} subtype {:#x} size {} fs_oid {:#x} oid {:#x} -> {:#x}",
+            m.obj_type, m.subtype, m.size, m.fs_oid, m.oid, m.paddr
+        );
+    }
+
+    let sm = c.space_manager()?;
+    dump_spaceman(&c, &sm)?;
+    dump_free_queues(&c, &sm)?;
+
+    println!("\n== reaper (oid {:#x})", sb.reaper_oid);
+    let reaper = c.ephemeral(sb.reaper_oid)?;
+    println!("  {} bytes; first 96 after the header: {}", reaper.len(), hex(&reaper[32..128.min(reaper.len())]));
+
+    println!("\n== container object map");
+    for (oid, xid, v) in c.omap_entries()? {
+        println!("  oid {oid:#x} xid {xid} -> {:#x} (flags {:#x}, size {})", v.paddr, v.flags, v.size);
+    }
+
+    for (i, vsb) in c.volume_superblocks()?.iter().enumerate() {
+        println!("\n== volume {i} \"{}\"", vsb.name);
+        println!(
+            "  xid {}  oid {:#x}  fs_index {}  features {:#x} ro_compat {:#x} incompat {:#x}  fs_flags {:#x}  role {:#x}",
+            vsb.hdr.xid, vsb.hdr.oid, vsb.fs_index, vsb.features, vsb.ro_compat_features, vsb.incompat_features, vsb.fs_flags, vsb.role
+        );
+        println!(
+            "  omap_oid {:#x}  root_tree_oid {:#x}  extentref_tree_oid {:#x}  snap_meta_tree_oid {:#x}  next_obj_id {:#x}",
+            vsb.omap_oid, vsb.root_tree_oid, vsb.extentref_tree_oid, vsb.snap_meta_tree_oid, vsb.next_obj_id
+        );
+        println!(
+            "  files {} dirs {} symlinks {} other {} snapshots {}  alloc_blocks {}  reserve {} quota {}",
+            vsb.num_files,
+            vsb.num_directories,
+            vsb.num_symlinks,
+            vsb.num_other_fsobjects,
+            vsb.num_snapshots,
+            vsb.alloc_blocks,
+            vsb.reserve_blocks,
+            vsb.quota_blocks
+        );
+        println!("  formatted_by \"{}\"  last_modified_by \"{}\"", vsb.formatted_by, vsb.last_modified_by);
+        match c.volume(i) {
+            Ok(v) => {
+                for (oid, xid, val) in v.omap_entries()? {
+                    println!("  omap: oid {oid:#x} xid {xid} -> {:#x} (flags {:#x})", val.paddr, val.flags);
+                }
+                let root = v.fs_root();
+                println!(
+                    "  fs tree root: oid {:#x} xid {} level {} keys {}  info {:?}",
+                    root.hdr.oid,
+                    root.hdr.xid,
+                    root.level,
+                    root.nkeys,
+                    root.info()?
+                );
+            }
+            Err(e) => println!("  (cannot open: {e})"),
+        }
+    }
+    Ok(())
+}
+
+fn ok(b: bool) -> &'static str {
+    if b { "ok" } else { "BAD" }
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join("")
+}
+
+fn ring(c: &Container, base: u64, blocks: u32) -> CliResult {
+    for i in 0..(blocks & 0x7fff_ffff) as u64 {
+        let b = c.raw_block(base + i)?;
+        if b.iter().all(|&x| x == 0) {
+            println!("  [{i:3}] {:#x}  (zero)", base + i);
+            continue;
+        }
+        let h = ObjHeader::parse(&b)?;
+        println!(
+            "  [{i:3}] {:#x}  type {:#010x} subtype {:#x} oid {:#x} xid {}  checksum {}",
+            base + i,
+            h.obj_type,
+            h.subtype,
+            h.oid,
+            h.xid,
+            ok(checksum::verify(&b))
+        );
+    }
+    Ok(())
+}
+
+fn dump_spaceman(c: &Container, sm: &Spaceman) -> CliResult {
+    println!("\n== space manager (oid {:#x}, xid {}, {} bytes)", sm.hdr.oid, sm.hdr.xid, sm.raw.len());
+    println!(
+        "  block_size {} blocks_per_chunk {} chunks_per_cib {} cibs_per_cab {}  flags {:#x} version {} struct_size {}",
+        sm.block_size, sm.blocks_per_chunk, sm.chunks_per_cib, sm.cibs_per_cab, sm.flags, sm.version, sm.struct_size
+    );
+    for (d, dv) in sm.dev.iter().enumerate() {
+        println!(
+            "  dev[{d}]: blocks {} chunks {} cibs {} cabs {} free {} addr_offset {:#x}  addrs {:x?}",
+            dv.block_count,
+            dv.chunk_count,
+            dv.cib_count,
+            dv.cab_count,
+            dv.free_count,
+            dv.addr_offset,
+            sm.dev_addrs(d)?
+        );
+    }
+    println!(
+        "  internal pool: base {:#x} blocks {}  bitmap ring base {:#x} blocks {} size_in_blocks {} tx_multiplier {}",
+        sm.ip_base, sm.ip_block_count, sm.ip_bm_base, sm.ip_bm_block_count, sm.ip_bm_size_in_blocks, sm.ip_bm_tx_multiplier
+    );
+    println!(
+        "  ip bitmap: free head {} tail {}  xid_offset {:#x} bitmap_offset {:#x} free_next_offset {:#x}",
+        sm.ip_bm_free_head, sm.ip_bm_free_tail, sm.ip_bm_xid_offset, sm.ip_bitmap_offset, sm.ip_bm_free_next_offset
+    );
+    println!("  ip_bm xids {:?}", sm.ip_bm_xids()?);
+    println!("  ip_bitmap indices {:?}", sm.ip_bitmap_indices()?);
+    println!("  ip_bm free_next {:?}", sm.ip_bm_free_next()?);
+    println!("  fs_reserve block_count {} alloc_count {}", sm.fs_reserve_block_count, sm.fs_reserve_alloc_count);
+    for (i, q) in sm.fq.iter().enumerate() {
+        println!(
+            "  fq[{i}]: count {} tree_oid {:#x} oldest_xid {} node_limit {}",
+            q.count, q.tree_oid, q.oldest_xid, q.tree_node_limit
+        );
+    }
+    // The internal-pool bitmap: one bit per internal-pool block.
+    for (slot, &idx) in sm.ip_bitmap_indices()?.iter().enumerate() {
+        let b = c.raw_block(sm.ip_bm_base + idx as u64)?;
+        let used: Vec<u64> = (0..sm.ip_block_count).filter(|&i| b[(i / 8) as usize] >> (i % 8) & 1 == 1).collect();
+        println!("  ip bitmap slot {slot} (ring block {idx}): used ip blocks {used:?}");
+    }
+    for d in 0..2 {
+        let dv = &sm.dev[d];
+        if dv.block_count == 0 {
+            continue;
+        }
+        let mut cibs = sm.dev_addrs(d)?;
+        if dv.cab_count > 0 {
+            let mut all = Vec::new();
+            for cab in cibs {
+                let (index, addrs) = spaceman::cib_addrs(&c.raw_block(cab)?)?;
+                println!("  cab {cab:#x} index {index}: cibs {addrs:x?}");
+                all.extend(addrs);
+            }
+            cibs = all;
+        }
+        for cib in cibs {
+            let b = c.raw_block(cib)?;
+            let (index, chunks) = spaceman::chunk_infos(&b)?;
+            println!("  cib {cib:#x} index {index} xid {} checksum {}: {} chunks", ObjHeader::parse(&b)?.xid, ok(checksum::verify(&b)), chunks.len());
+            for ch in chunks.iter().filter(|ch| ch.free_count != ch.block_count || ch.bitmap_addr != 0) {
+                println!(
+                    "    chunk addr {:#x} blocks {} free {} bitmap {:#x} xid {}",
+                    ch.addr, ch.block_count, ch.free_count, ch.bitmap_addr, ch.xid
+                );
+                if ch.bitmap_addr != 0 {
+                    let bm = c.raw_block(ch.bitmap_addr)?;
+                    let used = runs((0..ch.block_count as u64).filter(|&i| bm[(i / 8) as usize] >> (i % 8) & 1 == 1));
+                    println!("      used blocks (relative): {used}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Formats ascending numbers as compact ranges: `0-5,9,12-13`.
+fn runs(it: impl Iterator<Item = u64>) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur: Option<(u64, u64)> = None;
+    for n in it {
+        cur = match cur {
+            Some((a, b)) if n == b + 1 => Some((a, n)),
+            Some((a, b)) => {
+                out.push(if a == b { a.to_string() } else { format!("{a}-{b}") });
+                Some((n, n))
+            }
+            None => Some((n, n)),
+        };
+    }
+    if let Some((a, b)) = cur {
+        out.push(if a == b { a.to_string() } else { format!("{a}-{b}") });
+    }
+    if out.is_empty() { "none".into() } else { out.join(",") }
+}
+
+fn dump_free_queues(c: &Container, sm: &Spaceman) -> CliResult {
+    for (i, q) in sm.fq.iter().enumerate() {
+        if q.tree_oid == 0 {
+            continue;
+        }
+        println!("\n== free queue {i} (tree oid {:#x})", q.tree_oid);
+        let Some(root_paddr) = c.ephemeral_paddr(q.tree_oid) else {
+            println!("  (tree not in checkpoint map)");
+            continue;
+        };
+        let root = c.node(root_paddr)?;
+        let info = root.info()?;
+        println!("  root at {root_paddr:#x}: level {} keys {}  info {info:?}", root.level, root.nkeys);
+        let resolve = |oid: u64| {
+            c.ephemeral_paddr(oid).ok_or_else(|| apfs::Error::Corrupt(format!("ephemeral node {oid:#x} not in checkpoint")))
+        };
+        let src: &dyn NodeSource = &NodeReader(c);
+        btree::scan_with_ghosts(src, &root, &info, &resolve, &mut |k, v| {
+            let xid = u64::from_le_bytes(k[0..8].try_into().unwrap());
+            let paddr = u64::from_le_bytes(k[8..16].try_into().unwrap());
+            let count = v.map_or("1 (ghost)".to_string(), |v| u64::from_le_bytes(v[0..8].try_into().unwrap()).to_string());
+            println!("  xid {xid} paddr {paddr:#x} count {count}");
+            Ok(true)
+        })?;
+    }
+    Ok(())
+}
+
+/// `winapfs dev-rebuild-nodes <image>`: rebuilds every root B-tree node in
+/// the container from its parsed entries and compares the bytes, to prove the
+/// node writer matches existing nodes exactly.
+pub fn rebuild_nodes(src: &str) -> CliResult {
+    use apfs::btree_write::{build, NodeBuild};
+    let (c, _) = open_source(src, None)?;
+    let (mut same, mut differ) = (0, 0);
+    for paddr in 1..c.sb.block_count {
+        let Ok(raw) = c.raw_block(paddr) else { break };
+        let Ok(h) = ObjHeader::parse(&raw) else { continue };
+        if !matches!(h.kind(), 2 | 3) || !checksum::verify(&raw) {
+            continue;
+        }
+        let node = c.node(paddr)?;
+        if !node.is_root() {
+            continue; // non-root nodes need their tree's info; covered once trees grow
+        }
+        let info = node.info()?;
+        let entries = node.all_entries(&info)?;
+        let fixed = node.is_fixed().then_some((info.key_size as usize, info.val_size as usize));
+        let rebuilt = build(
+            &NodeBuild {
+                oid: h.oid,
+                xid: h.xid,
+                obj_type: h.obj_type,
+                subtype: h.subtype,
+                level: node.level,
+                root: true,
+                fixed,
+                info,
+                entries: &entries,
+            },
+            raw.len(),
+        )?;
+        if rebuilt == raw {
+            same += 1;
+        } else {
+            differ += 1;
+            let first = rebuilt.iter().zip(&raw).position(|(a, b)| a != b).unwrap_or(0);
+            println!(
+                "DIFF  block {paddr:#x} type {:#x} sub {:#x} keys {}: first difference at byte {first} (ours {:02x?}, theirs {:02x?})",
+                h.obj_type,
+                h.subtype,
+                node.nkeys,
+                &rebuilt[first..(first + 8).min(raw.len())],
+                &raw[first..(first + 8).min(raw.len())]
+            );
+        }
+    }
+    println!("rebuilt root nodes: {same} identical, {differ} different");
+    Ok(())
+}
+
+/// `winapfs dev-hash-check <source>`: recomputes the stored name hash of
+/// every directory entry and checks how entries are ordered, to validate the
+/// hash and ordering that writes must reproduce.
+pub fn hash_check(src: &str, vol: usize, part: Option<u32>) -> CliResult {
+    use apfs::name_hash::name_len_and_hash;
+    let (c, _) = open_source(src, part)?;
+    let v = c.volume(vol)?;
+    let ci = v.sb.is_case_insensitive();
+    let (mut total, mut ok, mut by_hash_ok, mut by_name_ok, mut pairs) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut bad: Vec<String> = Vec::new();
+    let mut prev: Option<(u64, u32, Vec<u8>)> = None;
+    v.scan_all(&mut |k, _| {
+        let hdr = u64::from_le_bytes(k[0..8].try_into().unwrap());
+        if hdr >> 60 != 9 || k.len() < 12 {
+            return Ok(true);
+        }
+        let id = hdr & 0x0fff_ffff_ffff_ffff;
+        let stored = u32::from_le_bytes(k[8..12].try_into().unwrap());
+        let raw = &k[12..];
+        let name = String::from_utf8_lossy(&raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())]).into_owned();
+        total += 1;
+        let ours = name_len_and_hash(&name, ci);
+        if ours == stored {
+            ok += 1;
+        } else if bad.len() < 15 {
+            bad.push(format!("  {name:?}: stored {:#08x} (len {}), ours {:#08x}", stored >> 10, stored & 0x3ff, ours >> 10));
+        }
+        if let Some((pid, ph, pn)) = &prev {
+            if *pid == id {
+                pairs += 1;
+                by_hash_ok += (*ph <= stored) as u64;
+                by_name_ok += (pn.as_slice() <= raw) as u64;
+            }
+        }
+        prev = Some((id, stored, raw.to_vec()));
+        Ok(true)
+    })?;
+    println!("directory entries {total}: hash matches {ok}, mismatches {}", total - ok);
+    for b in &bad {
+        println!("{b}");
+    }
+    println!("ordering within folders ({pairs} neighbouring pairs): by hash field {by_hash_ok}, by name bytes {by_name_ok}");
+    Ok(())
+}
+
+/// `winapfs dev-records <source> <id> [--vol N]`: prints the raw records of
+/// one file-system object, to copy real implementations' field choices.
+pub fn records(src: &str, id: u64, vol: usize, part: Option<u32>) -> CliResult {
+    let (c, _) = open_source(src, part)?;
+    let v = c.volume(vol)?;
+    v.scan_all(&mut |k, val| {
+        let hdr = u64::from_le_bytes(k[0..8].try_into().unwrap());
+        if hdr & 0x0fff_ffff_ffff_ffff == id {
+            println!("type {:2}  key {}  ({} bytes)", hdr >> 60, hex(&k[8..]), k.len());
+            println!("         val {}  ({} bytes)", hex(val), val.len());
+        }
+        Ok(true)
+    })?;
+    Ok(())
+}
+
+struct NodeReader<'a>(&'a Container);
+
+impl NodeSource for NodeReader<'_> {
+    fn read_node(&self, paddr: u64) -> apfs::Result<std::sync::Arc<btree::Node>> {
+        self.0.node(paddr)
+    }
+}
+
+/// `dev-omap-check`: object-map nodes holding keys newer than the node itself.
+pub fn omap_check(src: &str, part: Option<u32>) -> CliResult {
+    let (c, _) = open_source(src, part)?;
+    omap_nodes(&c, "container", c.sb.omap_oid)?;
+    for v in c.volume_superblocks()? {
+        omap_nodes(&c, &format!("volume \"{}\"", v.name), v.omap_oid)?;
+    }
+    Ok(())
+}
+
+fn omap_nodes(c: &Container, name: &str, omap_paddr: u64) -> CliResult {
+    let phys = c.raw_block(omap_paddr)?;
+    let omap_xid = ObjHeader::parse(&phys)?.xid;
+    let root_paddr = u64::from_le_bytes(phys[48..56].try_into().unwrap());
+    let root = c.node(root_paddr)?;
+    let info = root.info()?;
+    let (mut nodes, mut odd) = (0, 0);
+    let mut stack = vec![(root_paddr, 0u64)];
+    while let Some((p, parent)) = stack.pop() {
+        let n = c.node(p)?;
+        nodes += 1;
+        let entries = n.all_entries(&info)?;
+        let max_key_xid = entries.iter().map(|(k, _)| u64::from_le_bytes(k[8..16].try_into().unwrap())).max().unwrap_or(0);
+        if max_key_xid > n.hdr.xid {
+            odd += 1;
+            println!(
+                "  {name}: node {p:#x} (parent {parent:#x}) level {} xid {} holds key xid {max_key_xid} ({} keys)",
+                n.level,
+                n.hdr.xid,
+                entries.len()
+            );
+        }
+        if !n.is_leaf() {
+            for (_, v) in entries {
+                stack.push((u64::from_le_bytes(v.unwrap_or_default()[0..8].try_into().unwrap()), p));
+            }
+        }
+    }
+    println!("{name} object map at {omap_paddr:#x} (xid {omap_xid}), root {root_paddr:#x} (xid {}): {nodes} nodes, {odd} with newer keys", root.hdr.xid);
+    Ok(())
+}
+
+/// One owner per block, remembering which kind of thing claimed it first.
+struct Claims {
+    owner: Vec<u8>,
+    kinds: Vec<&'static str>,
+    overlaps: Vec<(u64, &'static str, &'static str)>,
+    overlap_count: u64,
+}
+
+impl Claims {
+    fn new(blocks: u64) -> Self {
+        Self { owner: vec![0; blocks as usize], kinds: vec![""], overlaps: Vec::new(), overlap_count: 0 }
+    }
+
+    fn kind(&mut self, k: &'static str) -> u8 {
+        match self.kinds.iter().position(|&x| x == k) {
+            Some(i) => i as u8,
+            None => {
+                self.kinds.push(k);
+                (self.kinds.len() - 1) as u8
+            }
+        }
+    }
+
+    fn claim(&mut self, start: u64, len: u64, k: &'static str) {
+        let id = self.kind(k);
+        for b in start..(start + len).min(self.owner.len() as u64) {
+            let prev = self.owner[b as usize];
+            if prev != 0 && prev != id {
+                self.overlap_count += 1;
+                if self.overlaps.len() < 10 {
+                    self.overlaps.push((b, self.kinds[prev as usize], k));
+                }
+            } else {
+                self.owner[b as usize] = id;
+            }
+        }
+    }
+}
+
+/// Every node of a physical B-tree.
+fn physical_tree_nodes(c: &Container, root_paddr: u64) -> apfs::Result<Vec<u64>> {
+    let root = c.node(root_paddr)?;
+    let info = root.info()?;
+    let mut out = Vec::new();
+    let mut stack = vec![root_paddr];
+    while let Some(p) = stack.pop() {
+        out.push(p);
+        let n = c.node(p)?;
+        if !n.is_leaf() {
+            for (_, v) in n.all_entries(&info)? {
+                stack.push(u64::from_le_bytes(v.unwrap_or_default()[0..8].try_into().unwrap()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `dev-space-check`: rebuilds which blocks are in use from everything that
+/// points at blocks, and compares with the space manager's bitmaps. A block
+/// in use but marked free would later be handed out again: data loss.
+pub fn space_check(src: &str, part: Option<u32>) -> CliResult {
+    let (c, location) = open_source(src, part)?;
+    space_check_container(&c, &location)
+}
+
+/// [`space_check`] on an open container.
+pub fn space_check_container(c: &Container, location: &str) -> CliResult {
+    let n = c.sb.block_count;
+    let bs = c.block_size() as u64;
+    let sm = c.space_manager()?;
+    println!("space check  {location}  xid {}", c.xid());
+
+    // The internal pool (where the space manager keeps chunk bitmaps and
+    // chunk-info blocks) has its own bitmap, in one or more ring blocks.
+    let mut ip_bitmap = Vec::new();
+    for index in sm.ip_bitmap_indices()? {
+        ip_bitmap.extend(c.raw_block(sm.ip_bm_base + index as u64)?);
+    }
+    let ip_marked = |p: u64| {
+        let i = p.wrapping_sub(sm.ip_base);
+        i < sm.ip_block_count && ip_bitmap[(i / 8) as usize] >> (i % 8) & 1 == 1
+    };
+    let mut ip_used = std::collections::HashSet::new();
+    let mut ip_problems = Vec::new();
+
+    // What the bitmaps say, chunk by chunk, with the free counts checked.
+    let mut marked = vec![false; n as usize];
+    let (mut free_total, mut bad_counts) = (0u64, 0u64);
+    for cib in sm.dev_addrs(spaceman::SD_MAIN)? {
+        if !ip_marked(cib) {
+            ip_problems.push(format!("chunk-info block {cib:#x} is free in the internal-pool bitmap"));
+        }
+        ip_used.insert(cib);
+        let (_, chunks) = spaceman::chunk_infos(&c.raw_block(cib)?)?;
+        for ch in chunks {
+            if ch.bitmap_addr != 0 {
+                if !ip_marked(ch.bitmap_addr) {
+                    ip_problems.push(format!("chunk bitmap {:#x} is free in the internal-pool bitmap", ch.bitmap_addr));
+                }
+                if !ip_used.insert(ch.bitmap_addr) {
+                    ip_problems.push(format!("internal-pool block {:#x} used twice", ch.bitmap_addr));
+                }
+            }
+            let mut zeros = ch.block_count as u64;
+            if ch.bitmap_addr != 0 {
+                let bm = c.raw_block(ch.bitmap_addr)?;
+                for i in 0..ch.block_count as u64 {
+                    if bm[(i / 8) as usize] >> (i % 8) & 1 == 1 {
+                        marked[(ch.addr + i) as usize] = true;
+                        zeros -= 1;
+                    }
+                }
+            }
+            if zeros != ch.free_count as u64 {
+                bad_counts += 1;
+            }
+            free_total += zeros;
+        }
+    }
+    // Internal-pool blocks waiting in their free queue stay marked too.
+    let resolve_ip =
+        |oid: u64| c.ephemeral_paddr(oid).ok_or_else(|| apfs::Error::Corrupt(format!("ephemeral node {oid:#x} not in checkpoint")));
+    if let Some(root_paddr) = c.ephemeral_paddr(sm.fq[spaceman::SFQ_IP].tree_oid) {
+        let root = c.node(root_paddr)?;
+        let info = root.info()?;
+        btree::scan_with_ghosts(&NodeReader(&c), &root, &info, &resolve_ip, &mut |k, v| {
+            let paddr = u64::from_le_bytes(k[8..16].try_into().unwrap());
+            let count = v.map_or(1, |v| u64::from_le_bytes(v[0..8].try_into().unwrap()));
+            for p in paddr..paddr + count {
+                if !ip_marked(p) {
+                    ip_problems.push(format!("queued internal-pool block {p:#x} is already free"));
+                }
+                if !ip_used.insert(p) {
+                    ip_problems.push(format!("internal-pool block {p:#x} queued but still in use"));
+                }
+            }
+            Ok(true)
+        })?;
+    }
+    let ip_leaked = (0..sm.ip_block_count).filter(|&i| ip_marked(sm.ip_base + i) && !ip_used.contains(&(sm.ip_base + i))).count();
+    println!(
+        "internal pool  {} blocks in use, {ip_leaked} marked but unused, {} problems",
+        ip_used.len(),
+        ip_problems.len()
+    );
+    for p in ip_problems.iter().take(10) {
+        println!("  {p}");
+    }
+
+    let dev_free = sm.dev[spaceman::SD_MAIN].free_count;
+    println!(
+        "bitmaps    {free_total} blocks free; chunks with a wrong free count: {bad_counts}; device free count {dev_free} ({})",
+        if free_total == dev_free { "matches" } else { "DOES NOT MATCH" }
+    );
+
+    // Everything that points at main-device blocks.
+    let mut claims = Claims::new(n);
+    claims.claim(0, 1, "container superblock");
+    claims.claim(c.sb.xp_desc_base, (c.sb.xp_desc_blocks & 0x7fff_ffff) as u64, "checkpoint descriptor area");
+    claims.claim(c.sb.xp_data_base, (c.sb.xp_data_blocks & 0x7fff_ffff) as u64, "checkpoint data area");
+    claims.claim(sm.ip_base, sm.ip_block_count, "internal pool");
+    claims.claim(sm.ip_bm_base, sm.ip_bm_block_count as u64, "internal-pool bitmap ring");
+    claims.claim(c.sb.omap_oid, 1, "object map");
+    let nx_omap_root = u64::from_le_bytes(c.raw_block(c.sb.omap_oid)?[48..56].try_into().unwrap());
+    for p in physical_tree_nodes(&c, nx_omap_root)? {
+        claims.claim(p, 1, "object map node");
+    }
+    for (_, _, v) in c.omap_entries()? {
+        claims.claim(v.paddr, 1, "volume superblock");
+    }
+    for (i, vsb) in c.volume_superblocks()?.iter().enumerate() {
+        let v = c.volume(i)?;
+        claims.claim(vsb.omap_oid, 1, "object map");
+        let root = u64::from_le_bytes(c.raw_block(vsb.omap_oid)?[48..56].try_into().unwrap());
+        for p in physical_tree_nodes(&c, root)? {
+            claims.claim(p, 1, "object map node");
+        }
+        for (_, _, val) in v.omap_entries()? {
+            claims.claim(val.paddr, 1, "file-system tree node");
+        }
+        for p in physical_tree_nodes(&c, vsb.extentref_tree_oid)? {
+            claims.claim(p, 1, "extent-reference tree node");
+        }
+        if vsb.snap_meta_tree_oid != 0 {
+            for p in physical_tree_nodes(&c, vsb.snap_meta_tree_oid)? {
+                claims.claim(p, 1, "snapshot tree node");
+            }
+        }
+        v.scan_all(&mut |k, val| {
+            if u64::from_le_bytes(k[0..8].try_into().unwrap()) >> 60 == 8 && val.len() >= 16 {
+                let len = u64::from_le_bytes(val[0..8].try_into().unwrap()) & 0x00ff_ffff_ffff_ffff;
+                let phys = u64::from_le_bytes(val[8..16].try_into().unwrap());
+                if phys != 0 {
+                    claims.claim(phys, len.div_ceil(bs), "file data");
+                }
+            }
+            Ok(true)
+        })?;
+    }
+    // Blocks waiting in the main free queue stay allocated until released.
+    let resolve =
+        |oid: u64| c.ephemeral_paddr(oid).ok_or_else(|| apfs::Error::Corrupt(format!("ephemeral node {oid:#x} not in checkpoint")));
+    let mut queued = Vec::new();
+    if let Some(root_paddr) = c.ephemeral_paddr(sm.fq[spaceman::SFQ_MAIN].tree_oid) {
+        let root = c.node(root_paddr)?;
+        let info = root.info()?;
+        btree::scan_with_ghosts(&NodeReader(&c), &root, &info, &resolve, &mut |k, v| {
+            let paddr = u64::from_le_bytes(k[8..16].try_into().unwrap());
+            let count = v.map_or(1, |v| u64::from_le_bytes(v[0..8].try_into().unwrap()));
+            queued.push((paddr, count));
+            Ok(true)
+        })?;
+    }
+    for (p, count) in queued {
+        claims.claim(p, count, "free queue (pending release)");
+    }
+
+    // Compare.
+    let mut in_use_but_free: std::collections::BTreeMap<&str, (u64, u64)> = Default::default();
+    let mut leaked = 0u64;
+    for b in 0..n {
+        let owner = claims.owner[b as usize];
+        if owner != 0 && !marked[b as usize] {
+            in_use_but_free.entry(claims.kinds[owner as usize]).or_insert((0, b)).0 += 1;
+        } else if owner == 0 && marked[b as usize] {
+            leaked += 1;
+        }
+    }
+    println!("overlaps   {} blocks claimed by two different things", claims.overlap_count);
+    for (b, a, k) in &claims.overlaps {
+        println!("  block {b:#x}: {a} and {k}");
+    }
+    let lost: u64 = in_use_but_free.values().map(|v| v.0).sum();
+    println!("in use but marked free: {lost} blocks");
+    for (k, (count, first)) in &in_use_but_free {
+        println!("  {k}: {count} (first at {first:#x})");
+    }
+    println!("allocated but unused (leaked): {leaked} blocks ({})", crate::human_size(leaked * bs));
+    if lost > 0 || claims.overlap_count > 0 || !ip_problems.is_empty() {
+        return Err(CliError::new("the space map is inconsistent"));
+    }
+    println!("result     consistent: nothing in use is marked free, nothing is claimed twice");
+    Ok(())
+}

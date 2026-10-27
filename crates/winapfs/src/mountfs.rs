@@ -1,13 +1,13 @@
-//! A read-only WinFsp file system. Names, sizes and bytes come from a
-//! [`Backend`]: an APFS volume, or a small in-memory tree that tests the
-//! WinFsp side without a Mac drive.
+//! A WinFsp file system. Names, sizes and bytes come from a [`Backend`]: an
+//! APFS volume, or a small in-memory tree that tests the WinFsp side without
+//! a Mac drive. Read-only unless the backend is writable.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr::{copy_nonoverlapping, null_mut};
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::winfsp::*;
@@ -20,6 +20,8 @@ const NAME_MAX: usize = 1024;
 /// Everyone may read, list and run; SYSTEM and Administrators get full
 /// control, which the read-only volume makes moot.
 const SDDL: &str = "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;WD)";
+/// Writable mounts: everyone gets full control, as on a USB stick.
+const SDDL_WRITABLE: &str = "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)";
 
 /// What Windows needs to know about a file. Times are nanoseconds since 1970.
 #[derive(Clone, Copy, Debug)]
@@ -32,6 +34,15 @@ pub struct Meta {
     pub access: u64,
     pub write: u64,
     pub change: u64,
+}
+
+/// Times to set, in nanoseconds since 1970; `None` leaves one alone.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetTimes {
+    pub create: Option<u64>,
+    pub access: Option<u64>,
+    pub write: Option<u64>,
+    pub change: Option<u64>,
 }
 
 pub trait FileReader: Send + Sync {
@@ -52,6 +63,46 @@ pub trait Backend: Send + Sync {
     /// Two names are the same entry exactly when their keys are equal.
     fn name_key(&self, name: &str) -> String;
     fn open(&'static self, file: &Meta) -> Result<Box<dyn FileReader>, NTSTATUS>;
+
+    // Writable backends implement the rest; reads then go through `read`,
+    // since file contents can change while open.
+    fn writable(&self) -> bool {
+        false
+    }
+    fn read(&self, _id: u64, _off: u64, _buf: &mut [u8]) -> Result<usize, NTSTATUS> {
+        Err(STATUS_NOT_SUPPORTED)
+    }
+    /// A file's current details.
+    fn stat(&self, _id: u64) -> Result<Meta, NTSTATUS> {
+        Err(STATUS_NOT_SUPPORTED)
+    }
+    fn create(&self, _dir: u64, _name: &str, _is_dir: bool) -> Result<Meta, NTSTATUS> {
+        Err(STATUS_MEDIA_WRITE_PROTECTED)
+    }
+    /// Writes bytes; returns the new file size.
+    fn write(&self, _id: u64, _off: u64, _data: &[u8]) -> Result<u64, NTSTATUS> {
+        Err(STATUS_MEDIA_WRITE_PROTECTED)
+    }
+    fn set_size(&self, _id: u64, _size: u64) -> Result<(), NTSTATUS> {
+        Err(STATUS_MEDIA_WRITE_PROTECTED)
+    }
+    fn remove(&self, _dir: u64, _name: &str) -> Result<(), NTSTATUS> {
+        Err(STATUS_MEDIA_WRITE_PROTECTED)
+    }
+    fn rename(&self, _sdir: u64, _sname: &str, _ddir: u64, _dname: &str, _replace: bool) -> Result<(), NTSTATUS> {
+        Err(STATUS_MEDIA_WRITE_PROTECTED)
+    }
+    fn set_info(&self, _id: u64, _times: SetTimes, _hidden: Option<bool>) -> Result<(), NTSTATUS> {
+        Err(STATUS_MEDIA_WRITE_PROTECTED)
+    }
+    /// Makes everything written so far durable.
+    fn flush(&self) -> Result<(), NTSTATUS> {
+        Ok(())
+    }
+    /// A file written through the mount was closed.
+    fn file_closed(&self) -> Result<(), NTSTATUS> {
+        self.flush()
+    }
 }
 
 struct Child {
@@ -66,10 +117,25 @@ struct Listing {
     by_key: HashMap<String, usize>,
 }
 
+/// An open file or folder.
 struct Handle {
-    meta: Meta,
-    info: FileInfo,
+    /// Shared by every open handle of the file: Windows' cache manager may
+    /// write through any of them, and all must agree on the size.
+    meta: Arc<Mutex<Meta>>,
+    /// The folder it is in (the root is its own parent).
+    parent: u64,
+    /// Its name starts with a dot, which Windows shows as hidden.
+    dot_name: bool,
     reader: OnceLock<Result<ReadAhead, NTSTATUS>>,
+    /// Data changed through this handle; commit when it closes.
+    wrote: AtomicBool,
+    deleted: AtomicBool,
+}
+
+impl Handle {
+    fn meta(&self) -> Meta {
+        *self.meta.lock().unwrap()
+    }
 }
 
 /// Smallest and largest fetch from the backend. Even through the Windows
@@ -127,12 +193,15 @@ impl FileReader for ReadAhead {
 
 struct Fs {
     backend: &'static dyn Backend,
+    writable: bool,
     api: Api,
     security: Vec<u8>,
     label: Vec<u16>,
     root: (Meta, FileInfo),
     dirs: Mutex<HashMap<u64, Arc<Listing>>>,
-    paths: Mutex<HashMap<String, (Meta, FileInfo)>>,
+    paths: Mutex<HashMap<String, (u64, Meta, FileInfo)>>,
+    /// Details of open files, by id, with how many handles share them.
+    open_files: Mutex<HashMap<u64, (usize, Arc<Mutex<Meta>>)>>,
 }
 
 /// Characters a Mac name may hold but Windows rejects (reserved characters,
@@ -166,11 +235,24 @@ fn filetime(ns: u64) -> u64 {
     ns / 100 + 116_444_736_000_000_000
 }
 
+/// The reverse of [`filetime`]; 0 ("leave it") becomes `None`.
+fn from_filetime(ft: u64) -> Option<u64> {
+    (ft != 0).then(|| ft.saturating_sub(116_444_736_000_000_000).saturating_mul(100))
+}
+
+/// Splits `\a\b\c` into `\a\b` and `c`.
+fn split_path(path: &[u16]) -> (&[u16], &[u16]) {
+    match path.iter().rposition(|&c| c == b'\\' as u16) {
+        Some(i) => (&path[..i], &path[i + 1..]),
+        None => (&[], path),
+    }
+}
+
 impl Fs {
-    fn info(&self, m: &Meta, name: &str) -> FileInfo {
+    fn info(&self, m: &Meta, dot_name: bool) -> FileInfo {
         let bs = self.backend.block_size();
         let mut attrs = if m.is_dir { FILE_ATTRIBUTE_DIRECTORY } else { FILE_ATTRIBUTE_ARCHIVE };
-        if m.hidden || name.starts_with('.') {
+        if m.hidden || dot_name {
             attrs |= FILE_ATTRIBUTE_HIDDEN;
         }
         FileInfo {
@@ -186,6 +268,37 @@ impl Fs {
         }
     }
 
+    fn handle_info(&self, h: &Handle) -> FileInfo {
+        self.info(&h.meta(), h.dot_name)
+    }
+
+    /// A handle for a file just opened or created; joins the file's shared
+    /// details if it is open already.
+    fn new_handle(&self, meta: Meta, parent: u64, dot_name: bool) -> Handle {
+        let mut open = self.open_files.lock().unwrap();
+        let entry = open.entry(meta.id).or_insert_with(|| (0, Arc::new(Mutex::new(meta))));
+        entry.0 += 1;
+        Handle {
+            meta: Arc::clone(&entry.1),
+            parent,
+            dot_name,
+            reader: OnceLock::new(),
+            wrote: AtomicBool::new(false),
+            deleted: AtomicBool::new(false),
+        }
+    }
+
+    fn drop_handle(&self, h: &Handle) {
+        let id = h.meta().id;
+        let mut open = self.open_files.lock().unwrap();
+        if let Some(entry) = open.get_mut(&id) {
+            entry.0 -= 1;
+            if entry.0 == 0 {
+                open.remove(&id);
+            }
+        }
+    }
+
     fn listing(&self, dir: u64) -> Result<Arc<Listing>, NTSTATUS> {
         if let Some(l) = self.dirs.lock().unwrap().get(&dir) {
             return Ok(Arc::clone(l));
@@ -195,8 +308,11 @@ impl Fs {
             .list(dir)?
             .into_iter()
             .map(|(name, meta)| {
-                let child =
-                    Child { win_name: mac_to_win(&name).encode_utf16().collect(), info: self.info(&meta, &name), meta };
+                let child = Child {
+                    win_name: mac_to_win(&name).encode_utf16().collect(),
+                    info: self.info(&meta, name.starts_with('.')),
+                    meta,
+                };
                 (self.backend.name_key(&name), child)
             })
             .collect();
@@ -211,18 +327,29 @@ impl Fs {
         Ok(listing)
     }
 
-    /// Resolves a WinFsp path such as `\Folder\file.txt`.
-    fn resolve(&self, path: &[u16]) -> Result<(Meta, FileInfo), NTSTATUS> {
+    /// Forgets cached folder contents after a change.
+    fn invalidate(&self, dirs: &[u64]) {
+        let mut cache = self.dirs.lock().unwrap();
+        for d in dirs {
+            cache.remove(d);
+        }
+        self.paths.lock().unwrap().clear();
+    }
+
+    /// Resolves a WinFsp path such as `\Folder\file.txt` to its parent
+    /// folder's id and its details.
+    fn resolve(&self, path: &[u16]) -> Result<(u64, Meta, FileInfo), NTSTATUS> {
         let path = String::from_utf16_lossy(path);
         let comps: Vec<&str> = path.split('\\').filter(|c| !c.is_empty()).collect();
         if comps.is_empty() {
-            return Ok(self.root);
+            return Ok((self.root.0.id, self.root.0, self.root.1));
         }
         let cache_key = self.backend.name_key(&win_to_mac(&path));
         if let Some(hit) = self.paths.lock().unwrap().get(&cache_key) {
             return Ok(*hit);
         }
         let mut cur = self.root;
+        let mut parent = self.root.0.id;
         for (i, comp) in comps.iter().enumerate() {
             let last = i + 1 == comps.len();
             if !cur.0.is_dir {
@@ -234,14 +361,31 @@ impl Fs {
                 return Err(if last { STATUS_OBJECT_NAME_NOT_FOUND } else { STATUS_OBJECT_PATH_NOT_FOUND });
             };
             let child = &listing.entries[idx];
+            parent = cur.0.id;
             cur = (child.meta, child.info);
+        }
+        if self.writable {
+            // Sizes and times move while files are written; ask afresh.
+            let dot = comps.last().is_some_and(|c| c.starts_with('.'));
+            let meta = self.backend.stat(cur.0.id)?;
+            return Ok((parent, meta, self.info(&meta, dot)));
         }
         let mut cache = self.paths.lock().unwrap();
         if cache.len() >= PATH_CACHE_CAP {
             cache.clear();
         }
-        cache.insert(cache_key, cur);
-        Ok(cur)
+        cache.insert(cache_key, (parent, cur.0, cur.1));
+        Ok((parent, cur.0, cur.1))
+    }
+
+    /// The folder a new name goes into, and the name in Mac form.
+    fn parent_and_name(&self, path: &[u16]) -> Result<(u64, String), NTSTATUS> {
+        let (dir, leaf) = split_path(path);
+        let (_, meta, _) = self.resolve(dir)?;
+        if !meta.is_dir {
+            return Err(STATUS_OBJECT_PATH_NOT_FOUND);
+        }
+        Ok((meta.id, win_to_mac(&String::from_utf16_lossy(leaf))))
     }
 
     unsafe fn copy_security(&self, sd: *mut c_void, sd_size: *mut usize) -> NTSTATUS {
@@ -281,6 +425,10 @@ unsafe fn this<'a>(fs: *mut FileSystem) -> &'a Fs {
     &*((*fs).user_context as *const Fs)
 }
 
+unsafe fn handle<'a>(file_context: *mut c_void) -> &'a Handle {
+    &*(file_context as *const Handle)
+}
+
 unsafe fn wstr<'a>(p: *const u16) -> &'a [u16] {
     if p.is_null() {
         return &[];
@@ -290,6 +438,10 @@ unsafe fn wstr<'a>(p: *const u16) -> &'a [u16] {
         n += 1;
     }
     std::slice::from_raw_parts(p, n)
+}
+
+fn last_is_dot(path: &[u16]) -> bool {
+    split_path(path).1.first() == Some(&(b'.' as u16))
 }
 
 /// Panics must not unwind into WinFsp; report them as an internal error.
@@ -322,7 +474,7 @@ unsafe extern "system" fn get_security_by_name(
 ) -> NTSTATUS {
     guard(|| {
         let me = this(fs);
-        let (_, info) = me.resolve(wstr(name))?;
+        let (_, _, info) = me.resolve(wstr(name))?;
         if !attrs.is_null() {
             *attrs = info.file_attributes;
         }
@@ -343,49 +495,112 @@ unsafe extern "system" fn open(
 ) -> NTSTATUS {
     guard(|| {
         let me = this(fs);
-        let (meta, info) = me.resolve(wstr(name))?;
+        let path = wstr(name);
+        let (parent, meta, _) = me.resolve(path)?;
         if create_options & FILE_DIRECTORY_FILE != 0 && !meta.is_dir {
             return Err(STATUS_NOT_A_DIRECTORY);
         }
         if create_options & FILE_NON_DIRECTORY_FILE != 0 && meta.is_dir {
             return Err(STATUS_FILE_IS_A_DIRECTORY);
         }
-        *file_context = Box::into_raw(Box::new(Handle { meta, info, reader: OnceLock::new() })).cast();
-        *file_info = info;
+        let h = me.new_handle(meta, parent, last_is_dot(path));
+        *file_info = me.handle_info(&h);
+        *file_context = Box::into_raw(Box::new(h)).cast();
         Ok(())
     })
 }
 
-/// WinFsp will not dispatch opens unless Create and Overwrite exist, even on
-/// a read-only volume; both just refuse.
+/// Creates a file or folder. (WinFsp will not dispatch opens unless Create
+/// and Overwrite exist, so read-only mounts have them too, and refuse.)
 unsafe extern "system" fn create(
-    _fs: *mut FileSystem,
-    _name: *const u16,
-    _create_options: u32,
+    fs: *mut FileSystem,
+    name: *const u16,
+    create_options: u32,
     _granted_access: u32,
-    _attributes: u32,
+    attributes: u32,
     _sd: *mut c_void,
     _allocation_size: u64,
-    _file_context: *mut *mut c_void,
-    _file_info: *mut FileInfo,
+    file_context: *mut *mut c_void,
+    file_info: *mut FileInfo,
 ) -> NTSTATUS {
-    STATUS_MEDIA_WRITE_PROTECTED
+    guard(|| {
+        let me = this(fs);
+        if !me.writable {
+            return Err(STATUS_MEDIA_WRITE_PROTECTED);
+        }
+        let path = wstr(name);
+        let (dir, mac) = me.parent_and_name(path)?;
+        let is_dir = create_options & FILE_DIRECTORY_FILE != 0;
+        let mut meta = me.backend.create(dir, &mac, is_dir)?;
+        me.invalidate(&[dir]);
+        if attributes & FILE_ATTRIBUTE_HIDDEN != 0 {
+            me.backend.set_info(meta.id, SetTimes::default(), Some(true))?;
+            meta.hidden = true;
+        }
+        let h = me.new_handle(meta, dir, last_is_dot(path));
+        *file_info = me.handle_info(&h);
+        *file_context = Box::into_raw(Box::new(h)).cast();
+        Ok(())
+    })
 }
 
 unsafe extern "system" fn overwrite(
-    _fs: *mut FileSystem,
-    _file_context: *mut c_void,
-    _attributes: u32,
-    _replace_attributes: u8,
+    fs: *mut FileSystem,
+    file_context: *mut c_void,
+    attributes: u32,
+    replace_attributes: u8,
     _allocation_size: u64,
-    _file_info: *mut FileInfo,
+    file_info: *mut FileInfo,
 ) -> NTSTATUS {
-    STATUS_MEDIA_WRITE_PROTECTED
+    guard(|| {
+        let me = this(fs);
+        if !me.writable {
+            return Err(STATUS_MEDIA_WRITE_PROTECTED);
+        }
+        let h = handle(file_context);
+        let id = h.meta().id;
+        me.backend.set_size(id, 0)?;
+        let hidden = attributes & FILE_ATTRIBUTE_HIDDEN != 0;
+        if hidden || replace_attributes != 0 {
+            me.backend.set_info(id, SetTimes::default(), Some(hidden))?;
+        }
+        h.wrote.store(true, Ordering::SeqCst);
+        *h.meta.lock().unwrap() = me.backend.stat(id)?;
+        *file_info = me.handle_info(h);
+        Ok(())
+    })
 }
 
-unsafe extern "system" fn close(_fs: *mut FileSystem, file_context: *mut c_void) {
-    if !file_context.is_null() {
-        drop(Box::from_raw(file_context.cast::<Handle>()));
+unsafe extern "system" fn cleanup(fs: *mut FileSystem, file_context: *mut c_void, name: *const u16, flags: u32) {
+    let me = this(fs);
+    if flags & CLEANUP_DELETE == 0 || name.is_null() || !me.writable {
+        return;
+    }
+    let h = handle(file_context);
+    let result = guard(|| {
+        let (dir, mac) = me.parent_and_name(wstr(name))?;
+        me.backend.remove(dir, &mac)?;
+        h.deleted.store(true, Ordering::SeqCst);
+        me.invalidate(&[dir, h.meta().id]);
+        Ok(())
+    });
+    if result != STATUS_SUCCESS {
+        eprintln!("winapfs: could not delete {} ({result:#x})", String::from_utf16_lossy(wstr(name)));
+    }
+}
+
+unsafe extern "system" fn close(fs: *mut FileSystem, file_context: *mut c_void) {
+    if file_context.is_null() {
+        return;
+    }
+    let h = Box::from_raw(file_context.cast::<Handle>());
+    let me = this(fs);
+    me.drop_handle(&h);
+    if h.wrote.load(Ordering::SeqCst) && !h.deleted.load(Ordering::SeqCst) {
+        if let Err(s) = me.backend.file_closed() {
+            eprintln!("winapfs: could not save changes ({s:#x})");
+        }
+        me.invalidate(&[h.parent]);
     }
 }
 
@@ -399,28 +614,169 @@ unsafe extern "system" fn read(
 ) -> NTSTATUS {
     guard(|| {
         let me = this(fs);
-        let h = &*(file_context as *const Handle);
-        if h.meta.is_dir {
+        let h = handle(file_context);
+        let meta = h.meta();
+        if meta.is_dir {
             return Err(STATUS_INVALID_DEVICE_REQUEST);
         }
-        if offset >= h.meta.size {
+        if offset >= meta.size {
             return Err(STATUS_END_OF_FILE);
+        }
+        let out = std::slice::from_raw_parts_mut(buffer.cast::<u8>(), length as usize);
+        if me.writable {
+            *transferred = me.backend.read(meta.id, offset, out)? as u32;
+            return Ok(());
         }
         // Readers are opened lazily: Explorer opens many files only to look at them.
         let reader = h
             .reader
-            .get_or_init(|| me.backend.open(&h.meta).map(|r| ReadAhead::new(r, h.meta.size)))
+            .get_or_init(|| me.backend.open(&meta).map(|r| ReadAhead::new(r, meta.size)))
             .as_ref()
             .map_err(|&s| s)?;
-        let out = std::slice::from_raw_parts_mut(buffer.cast::<u8>(), length as usize);
         *transferred = reader.read_at(offset, out)? as u32;
         Ok(())
     })
 }
 
-unsafe extern "system" fn get_file_info(_fs: *mut FileSystem, file_context: *mut c_void, file_info: *mut FileInfo) -> NTSTATUS {
-    *file_info = (*(file_context as *const Handle)).info;
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system" fn write(
+    fs: *mut FileSystem,
+    file_context: *mut c_void,
+    buffer: *mut c_void,
+    offset: u64,
+    length: u32,
+    write_to_eof: u8,
+    constrained_io: u8,
+    transferred: *mut u32,
+    file_info: *mut FileInfo,
+) -> NTSTATUS {
+    guard(|| {
+        let me = this(fs);
+        let h = handle(file_context);
+        let mut meta = h.meta.lock().unwrap();
+        if meta.is_dir {
+            return Err(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let off = if write_to_eof != 0 { meta.size } else { offset };
+        let mut len = length as u64;
+        if constrained_io != 0 {
+            // Paging writes never extend the file.
+            len = len.min(meta.size.saturating_sub(off));
+        }
+        if len > 0 {
+            let data = std::slice::from_raw_parts(buffer.cast::<u8>(), len as usize);
+            meta.size = me.backend.write(meta.id, off, data)?;
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+            meta.write = now;
+            meta.change = now;
+            h.wrote.store(true, Ordering::SeqCst);
+        }
+        *transferred = len as u32;
+        *file_info = me.info(&meta, h.dot_name);
+        Ok(())
+    })
+}
+
+unsafe extern "system" fn flush(fs: *mut FileSystem, file_context: *mut c_void, file_info: *mut FileInfo) -> NTSTATUS {
+    guard(|| {
+        let me = this(fs);
+        me.backend.flush()?;
+        if !file_context.is_null() && !file_info.is_null() {
+            *file_info = me.handle_info(handle(file_context));
+        }
+        Ok(())
+    })
+}
+
+unsafe extern "system" fn get_file_info(fs: *mut FileSystem, file_context: *mut c_void, file_info: *mut FileInfo) -> NTSTATUS {
+    *file_info = this(fs).handle_info(handle(file_context));
     STATUS_SUCCESS
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system" fn set_basic_info(
+    fs: *mut FileSystem,
+    file_context: *mut c_void,
+    attributes: u32,
+    creation: u64,
+    last_access: u64,
+    last_write: u64,
+    change: u64,
+    file_info: *mut FileInfo,
+) -> NTSTATUS {
+    guard(|| {
+        let me = this(fs);
+        let h = handle(file_context);
+        let id = h.meta().id;
+        let times = SetTimes {
+            create: from_filetime(creation),
+            access: from_filetime(last_access),
+            write: from_filetime(last_write),
+            change: from_filetime(change),
+        };
+        let hidden = (attributes != INVALID_FILE_ATTRIBUTES).then_some(attributes & FILE_ATTRIBUTE_HIDDEN != 0);
+        me.backend.set_info(id, times, hidden)?;
+        *h.meta.lock().unwrap() = me.backend.stat(id)?;
+        me.invalidate(&[h.parent]);
+        *file_info = me.handle_info(h);
+        Ok(())
+    })
+}
+
+unsafe extern "system" fn set_file_size(
+    fs: *mut FileSystem,
+    file_context: *mut c_void,
+    new_size: u64,
+    set_allocation_size: u8,
+    file_info: *mut FileInfo,
+) -> NTSTATUS {
+    guard(|| {
+        let me = this(fs);
+        let h = handle(file_context);
+        let mut meta = h.meta.lock().unwrap();
+        // An allocation size is only a hint, unless it cuts the file short.
+        if set_allocation_size == 0 || new_size < meta.size {
+            me.backend.set_size(meta.id, new_size)?;
+            meta.size = new_size;
+            h.wrote.store(true, Ordering::SeqCst);
+        }
+        *file_info = me.info(&meta, h.dot_name);
+        Ok(())
+    })
+}
+
+unsafe extern "system" fn can_delete(fs: *mut FileSystem, file_context: *mut c_void, _name: *const u16) -> NTSTATUS {
+    guard(|| {
+        let me = this(fs);
+        if !me.writable {
+            return Err(STATUS_MEDIA_WRITE_PROTECTED);
+        }
+        let meta = handle(file_context).meta();
+        if meta.is_dir && !me.backend.list(meta.id)?.is_empty() {
+            return Err(STATUS_DIRECTORY_NOT_EMPTY);
+        }
+        Ok(())
+    })
+}
+
+unsafe extern "system" fn rename(
+    fs: *mut FileSystem,
+    file_context: *mut c_void,
+    name: *const u16,
+    new_name: *const u16,
+    replace: u8,
+) -> NTSTATUS {
+    guard(|| {
+        let me = this(fs);
+        if !me.writable {
+            return Err(STATUS_MEDIA_WRITE_PROTECTED);
+        }
+        let (sdir, sname) = me.parent_and_name(wstr(name))?;
+        let (ddir, dname) = me.parent_and_name(wstr(new_name))?;
+        me.backend.rename(sdir, &sname, ddir, &dname, replace != 0)?;
+        me.invalidate(&[sdir, ddir, handle(file_context).meta().id]);
+        Ok(())
+    })
 }
 
 unsafe extern "system" fn get_security(
@@ -443,18 +799,20 @@ unsafe extern "system" fn read_directory(
 ) -> NTSTATUS {
     guard(|| {
         let me = this(fs);
-        let h = &*(file_context as *const Handle);
-        if !h.meta.is_dir {
+        let h = handle(file_context);
+        let meta = h.meta();
+        if !meta.is_dir {
             return Err(STATUS_NOT_A_DIRECTORY);
         }
-        let listing = me.listing(h.meta.id)?;
+        let listing = me.listing(meta.id)?;
+        let dir_info = me.handle_info(h);
         *transferred = 0;
 
         // Non-root directories start with "." and "..", then the sorted entries.
         // The marker is the last name returned by the previous call.
         const DOT: &[u16] = &[b'.' as u16];
         const DOTDOT: &[u16] = &[b'.' as u16, b'.' as u16];
-        let is_root = h.meta.id == me.root.0.id;
+        let is_root = meta.id == me.root.0.id;
         let (dots, start): (&[&[u16]], usize) = match (marker.is_null(), wstr(marker)) {
             (true, _) if is_root => (&[], 0),
             (true, _) => (&[DOT, DOTDOT], 0),
@@ -463,7 +821,7 @@ unsafe extern "system" fn read_directory(
             (false, m) => (&[], listing.entries.partition_point(|c| c.win_name.as_slice() <= m)),
         };
         for d in dots {
-            if !me.add_entry(d, &h.info, buffer, length, transferred) {
+            if !me.add_entry(d, &dir_info, buffer, length, transferred) {
                 return Ok(());
             }
         }
@@ -513,23 +871,28 @@ fn security_descriptor(sddl: &str) -> Result<Vec<u8>, String> {
 pub struct Mounted {
     fs: *mut FileSystem,
     api: Api,
+    backend: &'static dyn Backend,
 }
 
-/// Mounts `backend` read-only at `mount_point` (`X:` or a folder that does
-/// not exist yet) and starts serving requests on WinFsp's dispatcher threads.
+/// Mounts `backend` at `mount_point` (`X:` or a folder that does not exist
+/// yet), read-only unless the backend is writable, and starts serving
+/// requests on WinFsp's dispatcher threads.
 pub fn mount(backend: &'static dyn Backend, mount_point: &str) -> Result<Mounted, String> {
     let api = Api::load()?;
+    let writable = backend.writable();
     let root_meta = backend.root().map_err(|s| format!("cannot read the root folder ({s:#x})"))?;
     let fs: &'static mut Fs = Box::leak(Box::new(Fs {
         backend,
+        writable,
         api,
-        security: security_descriptor(SDDL)?,
+        security: security_descriptor(if writable { SDDL_WRITABLE } else { SDDL })?,
         label: backend.label().encode_utf16().collect(),
         root: (root_meta, FileInfo::default()),
         dirs: Mutex::new(HashMap::new()),
         paths: Mutex::new(HashMap::new()),
+        open_files: Mutex::new(HashMap::new()),
     }));
-    fs.root.1 = fs.info(&root_meta, "");
+    fs.root.1 = fs.info(&root_meta, false);
 
     // SAFETY: VolumeParams is plain old data; all-zero is its documented default.
     let mut params: VolumeParams = unsafe { std::mem::zeroed() };
@@ -539,14 +902,17 @@ pub fn mount(backend: &'static dyn Backend, mount_point: &str) -> Result<Mounted
     params.max_component_length = 255;
     params.volume_creation_time = filetime(backend.created());
     params.volume_serial_number = backend.serial();
-    // Infinite: nothing changes underneath a read-only mount, and WinFsp only
-    // lets the Windows cache manager cache file data with an infinite timeout.
+    // Infinite: WinFsp only lets the Windows cache manager cache file data
+    // with an infinite timeout, and every change comes through this mount.
     params.file_info_timeout = u32::MAX;
-    params.flags = VP_CASE_PRESERVED_NAMES
-        | VP_UNICODE_ON_DISK
-        | VP_PERSISTENT_ACLS
-        | VP_READ_ONLY_VOLUME
-        | VP_UM_FILE_CONTEXT_IS_USER_CONTEXT2;
+    params.flags = VP_CASE_PRESERVED_NAMES | VP_UNICODE_ON_DISK | VP_PERSISTENT_ACLS | VP_UM_FILE_CONTEXT_IS_USER_CONTEXT2;
+    if writable {
+        // Cached data reaches us before the last handle's cleanup, so the
+        // commit at close has it all.
+        params.flags |= VP_POST_CLEANUP_WHEN_MODIFIED_ONLY | VP_FLUSH_AND_PURGE_ON_CLEANUP;
+    } else {
+        params.flags |= VP_READ_ONLY_VOLUME;
+    }
     if !backend.case_insensitive() {
         params.flags |= VP_CASE_SENSITIVE_SEARCH;
     }
@@ -565,6 +931,15 @@ pub fn mount(backend: &'static dyn Backend, mount_point: &str) -> Result<Mounted
     iface.slots[OP_GET_FILE_INFO] = get_file_info as GetFileInfoFn as *const c_void;
     iface.slots[OP_GET_SECURITY] = get_security as GetSecurityFn as *const c_void;
     iface.slots[OP_READ_DIRECTORY] = read_directory as ReadDirectoryFn as *const c_void;
+    if writable {
+        iface.slots[OP_CLEANUP] = cleanup as CleanupFn as *const c_void;
+        iface.slots[OP_WRITE] = write as WriteFn as *const c_void;
+        iface.slots[OP_FLUSH] = flush as FlushFn as *const c_void;
+        iface.slots[OP_SET_BASIC_INFO] = set_basic_info as SetBasicInfoFn as *const c_void;
+        iface.slots[OP_SET_FILE_SIZE] = set_file_size as SetFileSizeFn as *const c_void;
+        iface.slots[OP_CAN_DELETE] = can_delete as CanDeleteFn as *const c_void;
+        iface.slots[OP_RENAME] = rename as RenameFn as *const c_void;
+    }
 
     let mut handle: *mut FileSystem = null_mut();
     unsafe {
@@ -588,15 +963,19 @@ pub fn mount(backend: &'static dyn Backend, mount_point: &str) -> Result<Mounted
             return Err(format!("WinFsp could not start serving requests (status {st:#010x})"));
         }
     }
-    Ok(Mounted { fs: handle, api })
+    Ok(Mounted { fs: handle, api, backend })
 }
 
 impl Mounted {
+    /// Unmounts, saving anything not yet committed.
     pub fn stop(self) {
         unsafe {
             (self.api.stop_dispatcher)(self.fs);
             (self.api.remove_mount_point)(self.fs);
             (self.api.delete)(self.fs);
+        }
+        if let Err(s) = self.backend.flush() {
+            eprintln!("winapfs: could not save the last changes ({s:#x})");
         }
     }
 }

@@ -9,6 +9,7 @@
 
 mod bytes;
 pub mod btree;
+pub mod btree_write;
 pub mod check;
 pub mod checksum;
 pub mod decmpfs;
@@ -16,12 +17,15 @@ pub mod dev;
 pub mod error;
 pub mod fs;
 pub mod gpt;
+pub mod name_hash;
 pub mod nx;
 pub mod obj;
 pub mod omap;
+pub mod spaceman;
+pub mod write;
 
 pub use bytes::format_uuid;
-pub use dev::{BlockDevice, FileDevice};
+pub use dev::{BlockDevice, FileDevice, ImageFile, WriteDevice};
 pub use error::{Error, Result};
-pub use fs::{DirEntry, Extent, FileKind, Inode, Volume};
+pub use fs::{DirEntry, Extent, FileKind, Inode, NameRule, Volume};
 pub use nx::Container;

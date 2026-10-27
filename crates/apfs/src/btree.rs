@@ -124,6 +124,17 @@ impl Node {
         Ok((key, Some(slice_at(&self.data, v_start, v_len)?)))
     }
 
+    /// All entries, ghosts included, as owned key/value pairs.
+    pub fn all_entries(&self, info: &BTreeInfo) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
+        (0..self.nkeys as usize)
+            .map(|i| self.entry(i, info).map(|(k, v)| (k.to_vec(), v.map(<[u8]>::to_vec))))
+            .collect()
+    }
+
+    pub fn is_fixed(&self) -> bool {
+        self.flags & BTNODE_FIXED_KV_SIZE != 0
+    }
+
     fn child(&self, i: usize, info: &BTreeInfo) -> Result<u64> {
         let (_, v) = self.entry(i, info)?;
         let v = v.ok_or_else(|| corrupt(format!("index node {:#x} entry {i} has no child", self.hdr.oid)))?;
@@ -151,7 +162,24 @@ pub fn scan(
     window: &dyn Fn(&[u8]) -> Result<Ordering>,
     f: &mut dyn FnMut(&[u8], &[u8]) -> Result<bool>,
 ) -> Result<()> {
-    scan_node(src, root, info, resolve, window, f).map(|_| ())
+    let mut live = |k: &[u8], v: Option<&[u8]>| match v {
+        Some(v) => f(k, v),
+        None => Ok(true),
+    };
+    scan_node(src, root, info, resolve, window, &mut live).map(|_| ())
+}
+
+/// [`scan`] including ghost entries (keys without a value), which some
+/// trees use deliberately: in a space-manager free queue a ghost means a
+/// count of one.
+pub fn scan_with_ghosts(
+    src: &dyn NodeSource,
+    root: &Node,
+    info: &BTreeInfo,
+    resolve: Resolve,
+    f: &mut dyn FnMut(&[u8], Option<&[u8]>) -> Result<bool>,
+) -> Result<()> {
+    scan_node(src, root, info, resolve, &|_| Ok(Ordering::Equal), f).map(|_| ())
 }
 
 fn scan_node(
@@ -160,7 +188,7 @@ fn scan_node(
     info: &BTreeInfo,
     resolve: Resolve,
     window: &dyn Fn(&[u8]) -> Result<Ordering>,
-    f: &mut dyn FnMut(&[u8], &[u8]) -> Result<bool>,
+    f: &mut dyn FnMut(&[u8], Option<&[u8]>) -> Result<bool>,
 ) -> Result<bool> {
     let n = node.nkeys as usize;
     if node.is_leaf() {
@@ -170,10 +198,8 @@ fn scan_node(
                 Ordering::Less => {}
                 Ordering::Greater => return Ok(false),
                 Ordering::Equal => {
-                    if let Some(v) = v {
-                        if !f(k, v)? {
-                            return Ok(false);
-                        }
+                    if !f(k, v)? {
+                        return Ok(false);
                     }
                 }
             }

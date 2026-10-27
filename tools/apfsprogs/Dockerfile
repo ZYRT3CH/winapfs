@@ -5,8 +5,10 @@ FROM ubuntu:24.04
 RUN apt-get update \
  && apt-get install -y --no-install-recommends build-essential git ca-certificates \
  && rm -rf /var/lib/apt/lists/*
+# Each tool builds in its own folder; we need the checker and the formatter.
 RUN git clone --depth 1 https://github.com/linux-apfs/apfsprogs /src/apfsprogs \
- && make -C /src/apfsprogs \
+ && make -C /src/apfsprogs/apfsck \
+ && make -C /src/apfsprogs/mkapfs \
  && git -C /src/apfsprogs log -1 --format='apfsprogs %H %cs' > /apfsprogs.version
-ENV PATH="/src/apfsprogs/apfsck:/src/apfsprogs/mkapfs:/src/apfsprogs/apfs-snap:/src/apfsprogs/apfs-label:${PATH}"
+ENV PATH="/src/apfsprogs/apfsck:/src/apfsprogs/mkapfs:${PATH}"
 WORKDIR /work

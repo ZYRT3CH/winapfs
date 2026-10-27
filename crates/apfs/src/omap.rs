@@ -45,6 +45,24 @@ impl Omap {
         Ok(Self { flags: u32_at(object, 32)?, snap_count: u32_at(object, 36)?, root, info })
     }
 
+    /// Every mapping as (oid, xid, value), in key order.
+    pub fn entries(&self, src: &dyn NodeSource) -> Result<Vec<(u64, u64, OmapVal)>> {
+        let mut out = Vec::new();
+        btree::scan(src, &self.root, &self.info, &|p| Ok(p), &|_| Ok(std::cmp::Ordering::Equal), &mut |k, v| {
+            out.push((
+                u64_at(k, 0)?,
+                u64_at(k, 8)?,
+                OmapVal { flags: u32_at(v, 0)?, size: u32_at(v, 4)?, paddr: u64_at(v, 8)? },
+            ));
+            Ok(true)
+        })?;
+        Ok(out)
+    }
+
+    pub fn tree_root(&self) -> &Node {
+        &self.root
+    }
+
     /// The newest mapping of `oid` at or before transaction `xid`.
     pub fn lookup(&self, src: &dyn NodeSource, oid: u64, xid: u64) -> Result<Option<OmapVal>> {
         let target = (oid, xid);

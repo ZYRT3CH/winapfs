@@ -8,6 +8,14 @@ pub enum Error {
     /// Valid APFS that uses a feature this crate does not handle yet.
     Unsupported(String),
     NotFound(String),
+    /// A name that is already taken.
+    Exists(String),
+    /// A name that APFS cannot store.
+    InvalidName(String),
+    /// A folder that still has entries.
+    NotEmpty(String),
+    /// No free space left.
+    NoSpace(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -19,6 +27,10 @@ impl fmt::Display for Error {
             Error::Corrupt(m) => write!(f, "corrupt APFS data: {m}"),
             Error::Unsupported(m) => write!(f, "not supported yet: {m}"),
             Error::NotFound(m) => write!(f, "not found: {m}"),
+            Error::Exists(m) => write!(f, "already exists: {m}"),
+            Error::InvalidName(m) => write!(f, "invalid name: {m}"),
+            Error::NotEmpty(m) => write!(f, "folder not empty: {m}"),
+            Error::NoSpace(m) => write!(f, "out of space: {m}"),
         }
     }
 }

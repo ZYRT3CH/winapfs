@@ -28,6 +28,10 @@ pub const STATUS_FILE_CORRUPT_ERROR: NTSTATUS = 0xC000_0102_u32 as i32;
 pub const STATUS_NOT_A_DIRECTORY: NTSTATUS = 0xC000_0103_u32 as i32;
 pub const STATUS_IO_DEVICE_ERROR: NTSTATUS = 0xC000_0185_u32 as i32;
 pub const STATUS_INTERNAL_ERROR: NTSTATUS = 0xC000_00E5_u32 as i32;
+pub const STATUS_OBJECT_NAME_INVALID: NTSTATUS = 0xC000_0033_u32 as i32;
+pub const STATUS_OBJECT_NAME_COLLISION: NTSTATUS = 0xC000_0035_u32 as i32;
+pub const STATUS_DISK_FULL: NTSTATUS = 0xC000_007F_u32 as i32;
+pub const STATUS_DIRECTORY_NOT_EMPTY: NTSTATUS = 0xC000_0101_u32 as i32;
 
 pub const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 pub const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
@@ -35,6 +39,11 @@ pub const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
 pub const FILE_ATTRIBUTE_HIDDEN: u32 = 0x02;
 pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 pub const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
+/// "Leave the attributes as they are" in SetBasicInfo.
+pub const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
+
+/// `FspCleanupDelete`: the last handle closed with delete pending.
+pub const CLEANUP_DELETE: u32 = 0x01;
 
 /// `FSP_FSCTL_DISK_DEVICE_NAME`
 pub const DISK_DEVICE_NAME: &str = "WinFsp.Disk";
@@ -74,6 +83,8 @@ pub const VP_CASE_PRESERVED_NAMES: u32 = 1 << 1;
 pub const VP_UNICODE_ON_DISK: u32 = 1 << 2;
 pub const VP_PERSISTENT_ACLS: u32 = 1 << 3;
 pub const VP_READ_ONLY_VOLUME: u32 = 1 << 9;
+pub const VP_POST_CLEANUP_WHEN_MODIFIED_ONLY: u32 = 1 << 10;
+pub const VP_FLUSH_AND_PURGE_ON_CLEANUP: u32 = 1 << 14;
 pub const VP_UM_FILE_CONTEXT_IS_USER_CONTEXT2: u32 = 1 << 16;
 
 /// `FSP_FSCTL_VOLUME_INFO`
@@ -137,9 +148,16 @@ pub const OP_GET_SECURITY_BY_NAME: usize = 2;
 pub const OP_CREATE: usize = 3;
 pub const OP_OPEN: usize = 4;
 pub const OP_OVERWRITE: usize = 5;
+pub const OP_CLEANUP: usize = 6;
 pub const OP_CLOSE: usize = 7;
 pub const OP_READ: usize = 8;
+pub const OP_WRITE: usize = 9;
+pub const OP_FLUSH: usize = 10;
 pub const OP_GET_FILE_INFO: usize = 11;
+pub const OP_SET_BASIC_INFO: usize = 12;
+pub const OP_SET_FILE_SIZE: usize = 13;
+pub const OP_CAN_DELETE: usize = 14;
+pub const OP_RENAME: usize = 15;
 pub const OP_GET_SECURITY: usize = 16;
 pub const OP_READ_DIRECTORY: usize = 18;
 
@@ -165,6 +183,16 @@ pub type GetFileInfoFn = unsafe extern "system" fn(*mut FileSystem, *mut c_void,
 pub type GetSecurityFn = unsafe extern "system" fn(*mut FileSystem, *mut c_void, *mut c_void, *mut usize) -> NTSTATUS;
 pub type ReadDirectoryFn =
     unsafe extern "system" fn(*mut FileSystem, *mut c_void, *const u16, *const u16, *mut c_void, u32, *mut u32) -> NTSTATUS;
+pub type CleanupFn = unsafe extern "system" fn(*mut FileSystem, *mut c_void, *const u16, u32);
+/// (file system, file, buffer, offset, length, write to end of file, constrained I/O, transferred, info)
+pub type WriteFn =
+    unsafe extern "system" fn(*mut FileSystem, *mut c_void, *mut c_void, u64, u32, u8, u8, *mut u32, *mut FileInfo) -> NTSTATUS;
+pub type FlushFn = unsafe extern "system" fn(*mut FileSystem, *mut c_void, *mut FileInfo) -> NTSTATUS;
+/// (file system, file, attributes, creation, last access, last write, change, info)
+pub type SetBasicInfoFn = unsafe extern "system" fn(*mut FileSystem, *mut c_void, u32, u64, u64, u64, u64, *mut FileInfo) -> NTSTATUS;
+pub type SetFileSizeFn = unsafe extern "system" fn(*mut FileSystem, *mut c_void, u64, u8, *mut FileInfo) -> NTSTATUS;
+pub type CanDeleteFn = unsafe extern "system" fn(*mut FileSystem, *mut c_void, *const u16) -> NTSTATUS;
+pub type RenameFn = unsafe extern "system" fn(*mut FileSystem, *mut c_void, *const u16, *const u16, u8) -> NTSTATUS;
 
 type CreateFn = unsafe extern "system" fn(*const u16, *const VolumeParams, *const Interface, *mut *mut FileSystem) -> NTSTATUS;
 type DeleteFn = unsafe extern "system" fn(*mut FileSystem);

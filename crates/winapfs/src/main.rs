@@ -1,4 +1,4 @@
-//! winapfs: read Mac (APFS) drives on Windows.
+//! winapfs: use Mac (APFS) drives on Windows, read and write.
 
 #[cfg(windows)]
 mod automount;
@@ -6,6 +6,10 @@ mod automount;
 mod backends;
 #[cfg(windows)]
 mod disks;
+mod dump;
+#[cfg(windows)]
+mod rehearse;
+mod trace;
 #[cfg(windows)]
 mod mountfs;
 #[cfg(windows)]
@@ -21,10 +25,11 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use apfs::check::{check_volume, CheckOptions};
+use apfs::write::{NewKind, Session};
 use apfs::{format_uuid, gpt, Container, FileDevice, FileKind, Inode, Volume};
 
-const USAGE: &str = r"winapfs - read Mac (APFS) drives on Windows.
-The disk is opened without write access, so nothing on it can change.
+const USAGE: &str = r"winapfs - use Mac (APFS) drives on Windows: read them, and write them (beta).
+Drives are opened read-only unless you ask for writing (--write, or winapfs write on).
 
 usage:
   winapfs info <source>
@@ -32,7 +37,9 @@ usage:
   winapfs get  <source> <path> <dest-folder> [--vol N] [--all] [--dry-run]
   winapfs cat  <source> <path> [--vol N]
   winapfs verify <source> [--vol N]      check the whole volume reads correctly
-  winapfs mount  <source> <X: or new-folder> [--vol N]   show the volume in Windows, read-only
+  winapfs mount  <source> <X: or new-folder> [--vol N]   show the volume in Windows (read-only,
+                 or with --write / --rehearse: writable)
+  winapfs write [on|off]                 plugged-in Mac drives appear writable (beta), or not
   winapfs unmount <X: or folder or all>
   winapfs mounts                         list mounted drive letters
   winapfs disks                          list connected disks with a Mac (APFS) partition
@@ -49,6 +56,8 @@ usage:
   --all      also copy macOS housekeeping folders (.Spotlight-V100, .fseventsd, ...)
   --dry-run  show what `get` would copy and rename, without writing anything
   --here     mount inside this terminal instead of through the launcher
+  --write    mount read-write: EXPERIMENTAL; checks the drive first
+  --rehearse mount writable, but keep every change in memory (a safe trial run)
 
 Raw disks can only be opened from an Administrator terminal.
 Mounting uses WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos
@@ -113,6 +122,8 @@ struct Args {
     all: bool,
     dry_run: bool,
     here: bool,
+    write: bool,
+    rehearse: bool,
 }
 
 fn parse_args() -> CliResult<Args> {
@@ -123,7 +134,7 @@ fn parse_args() -> CliResult<Args> {
         "-h" | "--help" => "help".to_string(),
         _ => cmd,
     };
-    let mut a = Args { cmd, pos: Vec::new(), vol: 0, part: None, all: false, dry_run: false, here: false };
+    let mut a = Args { cmd, pos: Vec::new(), vol: 0, part: None, all: false, dry_run: false, here: false, write: false, rehearse: false };
     while let Some(arg) = it.next() {
         let mut num = |flag: &str| -> CliResult<u64> {
             it.next()
@@ -136,6 +147,8 @@ fn parse_args() -> CliResult<Args> {
             "--all" => a.all = true,
             "--dry-run" => a.dry_run = true,
             "--here" => a.here = true,
+            "--write" => a.write = true,
+            "--rehearse" => a.rehearse = true,
             "-h" | "--help" => a.cmd = "help".into(),
             "-V" | "--version" => a.cmd = "version".into(),
             _ => a.pos.push(arg),
@@ -150,6 +163,7 @@ fn main() -> ExitCode {
     let double_clicked = std::env::args().len() == 1 && owns_console();
     #[cfg(not(windows))]
     let double_clicked = false;
+    trace::init();
     let result = if double_clicked { service::install() } else { parse_args().and_then(|a| run(&a)) };
     let code = match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -221,10 +235,15 @@ fn run(a: &Args) -> CliResult {
             let (src, at) = (&a.pos[0], &a.pos[1]);
             // Whole disk at a drive letter: go through the launcher when set up, so Explorer sees it.
             let disk_at_letter = service::is_drive_letter(at) && service::disk_source(src).is_some();
+            let mode = match (a.write, a.rehearse) {
+                (_, true) => MountMode::Rehearse,
+                (true, false) => MountMode::Write,
+                _ => MountMode::ReadOnly,
+            };
             if !a.here && disk_at_letter && service::registered() {
-                service::mount(src, at, a.vol, a.part)
+                service::mount(src, at, a.vol, a.part, mode)
             } else {
-                cmd_mount(Some(src), at, a.vol, a.part).map_err(|e| match e.msg.starts_with("access denied") {
+                cmd_mount(Some(src), at, a.vol, a.part, mode).map_err(|e| match e.msg.starts_with("access denied") {
                     true if disk_at_letter => e.hint(
                         "run `winapfs setup` once from an Administrator terminal; after that this works from a normal terminal",
                     ),
@@ -235,7 +254,7 @@ fn run(a: &Args) -> CliResult {
         #[cfg(windows)]
         "mount-demo" => {
             need(1)?;
-            cmd_mount(None, &a.pos[0], 0, None)
+            cmd_mount(None, &a.pos[0], 0, None, MountMode::ReadOnly)
         }
         #[cfg(windows)]
         "unmount" => {
@@ -274,8 +293,199 @@ fn run(a: &Args) -> CliResult {
             need(2)?;
             cmd_cat(&a.pos[0], &a.pos[1], a.vol, a.part)
         }
+        "dump" => {
+            need(1)?;
+            dump::dump(&a.pos[0], a.part)
+        }
+        #[cfg(windows)]
+        "write" => service::write_command(a.pos.first().map(String::as_str)),
+        "dev-records" => {
+            need(2)?;
+            let id = u64::from_str_radix(a.pos[1].trim_start_matches("0x"), if a.pos[1].starts_with("0x") { 16 } else { 10 })
+                .map_err(|_| CliError::new("id must be a number"))?;
+            dump::records(&a.pos[0], id, a.vol, a.part)
+        }
+        // dev-restamp <image> <block> <xid>: sets one object's transaction id
+        // and checksum, to normalize test copies; image files only.
+        "dev-restamp" => {
+            need(3)?;
+            let num = |s: &str| u64::from_str_radix(s.trim_start_matches("0x"), if s.starts_with("0x") { 16 } else { 10 });
+            let (paddr, xid) = (num(&a.pos[1]).map_err(|_| CliError::new("bad block"))?, num(&a.pos[2]).map_err(|_| CliError::new("bad xid"))?);
+            let img = apfs::ImageFile::open_rw(Path::new(&a.pos[0]))?;
+            let mut b = vec![0u8; 4096];
+            apfs::BlockDevice::read_at(&img, paddr * 4096, &mut b)?;
+            b[16..24].copy_from_slice(&xid.to_le_bytes());
+            let sum = apfs::checksum::compute(&b);
+            b[0..8].copy_from_slice(&sum.to_le_bytes());
+            apfs::WriteDevice::write_at(&img, paddr * 4096, &b)?;
+            println!("block {paddr:#x} now xid {xid}");
+            Ok(())
+        }
+        "dev-space-check" => {
+            need(1)?;
+            dump::space_check(&a.pos[0], a.part)
+        }
+        "dev-omap-check" => {
+            need(1)?;
+            dump::omap_check(&a.pos[0], a.part)
+        }
+        "dev-hash-check" => {
+            need(1)?;
+            dump::hash_check(&a.pos[0], a.vol, a.part)
+        }
+        "dev-rebuild-nodes" => {
+            need(1)?;
+            dump::rebuild_nodes(&a.pos[0])
+        }
+        // Developer commands for write support; image files only.
+        "dev-commit" => {
+            need(1)?;
+            let n: u32 = a.pos.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
+            let mut w = apfs::write::Writer::open(Path::new(&a.pos[0]))?;
+            for _ in 0..n {
+                println!("committed xid {}", w.commit_empty()?);
+            }
+            Ok(())
+        }
+        "dev-touch" | "dev-mkdir" => {
+            need(2)?;
+            let kind = if a.cmd == "dev-mkdir" { NewKind::Folder } else { NewKind::File };
+            let mut s = Session::open(Path::new(&a.pos[0]), a.vol)?;
+            for path in &a.pos[1..] {
+                let (dir, name) = split_path(&mut s, path)?;
+                let id = s.create(dir, name, kind)?;
+                println!("created {path:?} as inode {id} in xid {}", s.container().xid());
+            }
+            Ok(())
+        }
+        // dev-put <image> <local file> <path in image>: creates or replaces a file.
+        "dev-put" => {
+            need(3)?;
+            let mut src = File::open(&a.pos[1])?;
+            let len = src.metadata()?.len();
+            let dest = a.pos[2].trim_end_matches('/');
+            let mut s = Session::open(Path::new(&a.pos[0]), a.vol)?;
+            let start = Instant::now();
+            let id = dev_put(&mut s, &mut src, dest)?;
+            let secs = start.elapsed().as_secs_f64().max(1e-6);
+            println!(
+                "wrote {len} bytes to {dest:?} (inode {id}) in xid {}, {:.1} MB/s",
+                s.container().xid(),
+                len as f64 / secs / 1e6
+            );
+            Ok(())
+        }
+        // dev-fill <image> <count> [folder] [per-transaction]: makes files f000001...
+        "dev-fill" => {
+            need(2)?;
+            let count: u32 = a.pos[1].parse().map_err(|_| CliError::new("count must be a number"))?;
+            let dir = a.pos.get(2).map_or("", String::as_str);
+            let batch: u32 = a.pos.get(3).and_then(|s| s.parse().ok()).unwrap_or(1).max(1);
+            let mut s = Session::open(Path::new(&a.pos[0]), a.vol)?;
+            let dir_id = s.volume()?.lookup_path(dir)?.id;
+            let mut done = 0;
+            while done < count {
+                let n = batch.min(count - done);
+                let names: Vec<String> = (done..done + n).map(|i| format!("f{:06}", i + 1)).collect();
+                let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                s.create_many(dir_id, &refs, NewKind::File)?;
+                done += n;
+                if done % 500 == 0 || done == count {
+                    println!("{done} files, xid {}", s.container().xid());
+                }
+            }
+            Ok(())
+        }
+        "dev-rm" => {
+            need(2)?;
+            let mut s = Session::open(Path::new(&a.pos[0]), a.vol)?;
+            for path in &a.pos[1..] {
+                let (dir, name) = split_path(&mut s, path)?;
+                s.remove(dir, name)?;
+                println!("removed {path:?} in xid {}", s.container().xid());
+            }
+            Ok(())
+        }
+        // dev-mv <image> <from> <to> [replace]
+        "dev-mv" => {
+            need(3)?;
+            let mut s = Session::open(Path::new(&a.pos[0]), a.vol)?;
+            let (sdir, sname) = split_path(&mut s, &a.pos[1])?;
+            let (ddir, dname) = split_path(&mut s, &a.pos[2])?;
+            s.rename(sdir, sname, ddir, dname, a.pos.get(3).is_some_and(|x| x == "replace"))?;
+            println!("moved {:?} to {:?} in xid {}", a.pos[1], a.pos[2], s.container().xid());
+            Ok(())
+        }
+        // dev-script <image> <script>: runs write operations, one per line:
+        //   write <path> <offset> <local file> | size <path> <bytes> | flush
+        //   mkdir <path> | touch <path> | rm <path> | mv <from> <to> [replace]
+        "dev-script" => {
+            need(2)?;
+            let mut s = Session::open(Path::new(&a.pos[0]), a.vol)?;
+            run_script(&mut s, &a.pos[1])?;
+            println!("script done, xid {}", s.container().xid());
+            Ok(())
+        }
+        // dev-rehearse <source> <script> [metadata-folder]: runs a write script
+        // against a real disk with every write kept in memory; nothing is written.
+        "dev-rehearse" => {
+            need(2)?;
+            rehearse::run(&a.pos[0], &a.pos[1], a.vol, a.part, a.pos.get(2).map(Path::new))
+        }
+        // dev-real-write <source> <script> <container-uuid> <undo-file>: see rehearse.rs.
+        "dev-real-write" => {
+            need(4)?;
+            rehearse::real_write(&a.pos[0], &a.pos[1], &a.pos[2], Path::new(&a.pos[3]), a.vol, a.part)
+        }
+        "dev-bench-write" => {
+            need(1)?;
+            let mib = a.pos.get(1).and_then(|s| s.parse().ok()).unwrap_or(64);
+            rehearse::bench_write(&a.pos[0], mib, a.part)
+        }
+        "dev-undo" => {
+            need(2)?;
+            rehearse::undo(&a.pos[0], Path::new(&a.pos[1]), a.part)
+        }
+        "dev-rename" => {
+            need(2)?;
+            let mut w = apfs::write::Writer::open(Path::new(&a.pos[0]))?;
+            println!("committed xid {}", w.rename_volume(a.vol, &a.pos[1])?);
+            Ok(())
+        }
         other => Err(CliError::new(format!("unknown command `{other}`")).hint(USAGE)),
     }
+}
+
+/// Splits a path in an image into its folder's inode number and the last name.
+fn split_path<'p>(s: &mut Session, path: &'p str) -> Result<(u64, &'p str), CliError> {
+    let path = path.trim_end_matches('/');
+    let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+    Ok((s.lookup_path(dir)?, name))
+}
+
+/// Creates (or truncates) the file at `dest` and copies `src` into it.
+fn dev_put(s: &mut Session, src: &mut File, dest: &str) -> Result<u64, CliError> {
+    let existing = s.lookup_path(dest).ok();
+    let id = match existing {
+        Some(id) => id,
+        None => {
+            let (dir, name) = split_path(s, dest)?;
+            s.create(dir, name, NewKind::File)?
+        }
+    };
+    s.set_size(id, 0)?;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut off = 0;
+    loop {
+        let n = io::Read::read(src, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        s.write(id, off, &buf[..n])?;
+        off += n as u64;
+    }
+    s.flush()?;
+    Ok(id)
 }
 
 /// `disk3`, `disk:3` and `PhysicalDrive3` all mean `\\.\PhysicalDrive3`.
@@ -301,6 +511,13 @@ fn find_apfs_disk() -> CliResult<String> {
 }
 
 fn open_source(src: &str, part: Option<u32>) -> CliResult<(Container, String)> {
+    let (dev, location, ..) = open_device(src, part)?;
+    Ok((Container::open(Box::new(dev))?, location))
+}
+
+/// Opens a source read-only, addressed from the start of its APFS container.
+/// Also returns the device path and the container's byte offset in it.
+fn open_device(src: &str, part: Option<u32>) -> CliResult<(FileDevice, String, String, u64)> {
     let found;
     let src = if src.eq_ignore_ascii_case("auto") {
         found = find_apfs_disk()?;
@@ -319,8 +536,8 @@ fn open_source(src: &str, part: Option<u32>) -> CliResult<(Container, String)> {
         }
         _ => e.into(),
     })?;
-    let (dev, location) = match gpt::read_partitions(&dev)? {
-        None => (dev, path.clone()),
+    let (dev, location, base) = match gpt::read_partitions(&dev)? {
+        None => (dev, path.clone(), 0),
         Some(parts) => {
             let chosen = match part {
                 Some(n) => parts.iter().find(|p| p.number == n),
@@ -334,10 +551,10 @@ fn open_source(src: &str, part: Option<u32>) -> CliResult<(Container, String)> {
                 return Err(CliError::new(format!("no matching APFS partition on {path}"))
                     .hint(format!("partitions: {}", list.join(", "))));
             };
-            (dev.with_base(p.offset)?, format!("{path} partition {}", p.number))
+            (dev.with_base(p.offset)?, format!("{path} partition {}", p.number), p.offset)
         }
     };
-    Ok((Container::open(Box::new(dev))?, location))
+    Ok((dev, location, path, base))
 }
 
 fn cmd_info(src: &str, part: Option<u32>) -> CliResult {
@@ -634,13 +851,31 @@ fn cmd_verify(src: &str, vol: usize, part: Option<u32>) -> CliResult {
 
 /// Mounts an APFS volume (`src`) or, with `src == None`, the built-in demo tree.
 #[cfg(windows)]
-fn cmd_mount(src: Option<&str>, mount_point: &str, vol: usize, part: Option<u32>) -> CliResult {
+fn cmd_mount(src: Option<&str>, mount_point: &str, vol: usize, part: Option<u32>, mode: MountMode) -> CliResult {
     let is_drive = mount_point.len() == 2 && mount_point.ends_with(':');
     if !is_drive && Path::new(mount_point).exists() {
         return Err(CliError::new(format!("{mount_point} already exists"))
             .hint("WinFsp creates the mount folder itself; pick a path that does not exist yet"));
     }
+    let mut rw: Option<&'static backends::ApfsRwBackend> = None;
+    let mut mode = mode;
+    if let (Some(src), true) = (src, mode != MountMode::ReadOnly) {
+        match open_writable(src, part, vol, mode) {
+            Ok(b) => rw = Some(b),
+            Err(e) => {
+                // The files stay reachable: show the drive read-only instead.
+                eprintln!("winapfs: not mounting writable: {}; mounting read-only instead", e.msg);
+                println!("note      not writable: {}; mounted read-only instead", e.msg);
+                mode = MountMode::ReadOnly;
+            }
+        }
+    }
     let (backend, what): (&'static dyn mountfs::Backend, String) = match src {
+        Some(src) if rw.is_some() => {
+            let b = rw.unwrap();
+            b.start_committer();
+            (b, format!("volume {vol} \"{}\" from {src}", mountfs::Backend::label(b)))
+        }
         Some(src) => {
             let (c, location) = open_source(src, part)?;
             let c: &'static Container = Box::leak(Box::new(c));
@@ -651,7 +886,7 @@ fn cmd_mount(src: Option<&str>, mount_point: &str, vol: usize, part: Option<u32>
         None => (Box::leak(Box::new(backends::DemoBackend::new())), "the built-in demo tree".to_string()),
     };
     let mounted = mountfs::mount(backend, mount_point).map_err(CliError::new)?;
-    println!("mounted   {what} at {mount_point}, read-only");
+    println!("mounted   {what} at {mount_point}, {}", mode.describe());
     println!("stop      Ctrl+C here, or: winapfs unmount {mount_point}");
     println!("note      {WINFSP_NOTICE}");
     if is_drive && src.is_some_and(|s| service::disk_source(s).is_some()) && !service::registered() {
@@ -664,7 +899,64 @@ fn cmd_mount(src: Option<&str>, mount_point: &str, vol: usize, part: Option<u32>
     println!("unmounted {mount_point}");
     let _ = io::stdout().flush();
     mountfs::signal_unmounted();
+    if let Some(b) = rw {
+        println!("checking  the free-space map after writing");
+        let s = b.session();
+        if let Err(e) = dump::space_check_container(s.container(), mount_point) {
+            eprintln!("error: {}", e.msg);
+        }
+    }
     Ok(())
+}
+
+/// Opens a volume for a writable (or rehearsal) mount, after checking that
+/// nothing blocks writing and that the free-space map is consistent: never
+/// build on a space map that is already wrong.
+fn open_writable(src: &str, part: Option<u32>, vol: usize, mode: MountMode) -> CliResult<&'static backends::ApfsRwBackend> {
+    let (dev, location, path, base) = open_device(src, part)?;
+    let c = Container::open(Box::new(dev.try_clone()?))?;
+    let problems = apfs::write::check_writable(&c);
+    if !problems.is_empty() {
+        return Err(CliError::new(format!("this drive uses something winapfs cannot write yet ({})", problems.join("; "))));
+    }
+    println!("checking  the free-space map before writing (reads all metadata; about half a minute on a big drive)");
+    dump::space_check_container(&c, &location).map_err(|e| CliError::new(format!("the drive did not pass the check ({})", e.msg)))?;
+    let uuid = c.sb.uuid;
+    drop(c);
+    let s = match mode {
+        MountMode::Rehearse => apfs::write::Session::rehearsal(dev, vol)?.0,
+        _ => apfs::write::Session::open_real_disk(Path::new(&path), base, uuid, vol)?,
+    };
+    Ok(Box::leak(Box::new(backends::ApfsRwBackend::from_session(s)?)))
+}
+
+/// How `cmd_mount` mounts a volume.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MountMode {
+    ReadOnly,
+    /// EXPERIMENTAL: changes go to the disk.
+    Write,
+    /// Writable, but every write stays in memory and is gone after unmount.
+    Rehearse,
+}
+
+impl MountMode {
+    fn describe(self) -> &'static str {
+        match self {
+            MountMode::ReadOnly => "read-only",
+            MountMode::Write => "READ-WRITE (experimental)",
+            MountMode::Rehearse => "REHEARSAL (writable, but changes stay in memory and vanish at unmount)",
+        }
+    }
+
+    /// The launcher argument, if any.
+    pub fn arg(self) -> Option<&'static str> {
+        match self {
+            MountMode::ReadOnly => None,
+            MountMode::Write => Some("mode=write"),
+            MountMode::Rehearse => Some("mode=rehearse"),
+        }
+    }
 }
 
 fn cmd_cat(src: &str, path: &str, vol: usize, part: Option<u32>) -> CliResult {
@@ -817,4 +1109,63 @@ mod tests {
         assert_eq!(format_time(0), "1970-01-01 00:00");
         assert_eq!(format_time(1_700_000_000 * 1_000_000_000), "2023-11-14 22:13");
     }
+}
+
+/// Runs a write script (see `dev-script`) in a session, flushes it, then
+/// runs its `check` lines against what was committed.
+fn run_script(s: &mut Session, script: &str) -> CliResult {
+    let text = fs::read_to_string(script)?;
+    let mut checks = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let w: Vec<&str> = line.split_whitespace().collect();
+        let fail = |e: apfs::Error| CliError::new(format!("line {}: {line}: {e}", n + 1));
+        let id_of = |s: &mut Session, p: &str| s.lookup_path(p);
+        match w.as_slice() {
+            [] => {}
+            [c, ..] if c.starts_with('#') => {}
+            ["flush"] => s.flush().map_err(fail)?,
+            // batch: from here on, everything is one transaction (until flush).
+            ["batch"] => s.set_batch(true),
+            ["mkdir", p] | ["touch", p] => {
+                let kind = if w[0] == "mkdir" { NewKind::Folder } else { NewKind::File };
+                let (dir, name) = split_path(s, p)?;
+                s.create(dir, name, kind).map_err(fail)?;
+            }
+            ["rm", p] => {
+                let (dir, name) = split_path(s, p)?;
+                s.remove(dir, name).map_err(fail)?;
+            }
+            ["mv", from, to, rest @ ..] => {
+                let (sdir, sname) = split_path(s, from)?;
+                let (ddir, dname) = split_path(s, to)?;
+                s.rename(sdir, sname, ddir, dname, rest == ["replace"]).map_err(fail)?;
+            }
+            ["write", p, off, local] => {
+                let id = id_of(s, p).map_err(fail)?;
+                let off: u64 = off.parse().map_err(|_| CliError::new(format!("line {}: bad offset", n + 1)))?;
+                s.write(id, off, &fs::read(local)?).map_err(fail)?;
+            }
+            ["size", p, size] => {
+                let id = id_of(s, p).map_err(fail)?;
+                let size: u64 = size.parse().map_err(|_| CliError::new(format!("line {}: bad size", n + 1)))?;
+                s.set_size(id, size).map_err(fail)?;
+            }
+            // check <path> <local file>: after the commit, the file reads back
+            // exactly as the local one.
+            ["check", p, local] => checks.push((n + 1, p.to_string(), local.to_string())),
+            _ => return Err(CliError::new(format!("line {}: cannot parse {line:?}", n + 1))),
+        }
+    }
+    s.flush()?;
+    let v = s.volume()?;
+    for (line, p, local) in checks {
+        let mut got = Vec::new();
+        v.read_file(&v.lookup_path(&p)?, &mut got)?;
+        let want = fs::read(&local)?;
+        if got != want {
+            return Err(CliError::new(format!("line {line}: {p} reads back differently ({} bytes, expected {})", got.len(), want.len())));
+        }
+        println!("  check ok: {p} ({} bytes)", got.len());
+    }
+    Ok(())
 }

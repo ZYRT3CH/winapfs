@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use crate::automount::SERVICE_NAME;
 use crate::disks;
 use crate::winfsp::{wide, LaunchRecord, Launcher};
-use crate::{cmd_mount, source_path, CliError, CliResult, WINFSP_NOTICE};
+use crate::{cmd_mount, source_path, CliError, CliResult, MountMode, WINFSP_NOTICE};
 
 /// Launcher service class name, and the key under `HKLM\Software\WinFsp\Services`.
 pub(crate) const CLASS: &str = "winapfs";
@@ -203,7 +203,7 @@ pub fn setup(remove: bool) -> CliResult {
     }
 
     println!("installed {}  (on the system PATH; open a new terminal to use `winapfs`)", exe.display());
-    println!("registered with the WinFsp launcher; it runs winapfs as SYSTEM, read-only");
+    println!("registered with the WinFsp launcher; it runs winapfs as SYSTEM (read-only unless write mode is on)");
     println!("auto-mount service: {}", if automount_running() { "running, starts with Windows" } else { "installed but NOT running" });
     println!("allowed   to mount and unmount: your account ({sid}), Administrators, SYSTEM");
     println!("limits    the service mounts only whole disks (diskN) at drive letters");
@@ -214,7 +214,8 @@ pub fn setup(remove: bool) -> CliResult {
 
 /// `winapfs install`: everything a new user needs, asking for admin rights once.
 pub fn install() -> CliResult {
-    println!("winapfs shows Mac (APFS) drives in Windows Explorer. It only reads; it never changes the Mac drive.");
+    println!("winapfs shows Mac (APFS) drives in Windows Explorer. They open read-only, so nothing changes by accident;");
+    println!("to save files onto them too, run `winapfs write on` afterwards (beta).");
     println!();
     if Launcher::load().is_err() {
         println!("winapfs needs WinFsp, a free helper that lets programs act as drives (https://winfsp.dev).");
@@ -451,8 +452,112 @@ pub fn is_elevated() -> bool {
     }
 }
 
+/// The write-mode switch: a file in the install folder, which only
+/// administrators can change.
+fn write_switch() -> PathBuf {
+    install_dir().join("write-mode.on")
+}
+
+/// Whether plugged-in Mac drives are mounted writable.
+pub fn write_mode() -> bool {
+    write_switch().exists()
+}
+
+/// `winapfs write [on|off]`
+pub fn write_command(arg: Option<&str>) -> CliResult {
+    match arg {
+        None | Some("status") => {
+            if write_mode() {
+                println!("write mode is ON: Mac drives you plug in appear writable (EXPERIMENTAL)");
+                println!("turn off: winapfs write off");
+            } else {
+                println!("write mode is off: Mac drives you plug in appear read-only");
+                println!("turn on:  winapfs write on   (EXPERIMENTAL: back up what you cannot lose)");
+            }
+            Ok(())
+        }
+        Some(a @ ("on" | "off")) => {
+            if !is_elevated() {
+                println!("Windows will ask for permission.");
+                run_elevated(&format!("write {a}"))?;
+                return write_command(None);
+            }
+            if a == "on" {
+                std::fs::write(write_switch(), "Mac drives are mounted writable. Remove this file (winapfs write off) to stop.\r\n")
+                    .map_err(|e| CliError::new(format!("could not turn write mode on: {e}")))?;
+            } else if write_mode() {
+                std::fs::remove_file(write_switch()).map_err(|e| CliError::new(format!("could not turn write mode off: {e}")))?;
+            }
+            if automount_running() {
+                wait_for_mode(a == "on");
+            } else {
+                remount_all(if a == "on" { MountMode::Write } else { MountMode::ReadOnly });
+            }
+            Ok(())
+        }
+        Some(other) => Err(CliError::new(format!("`winapfs write {other}`: say on or off"))),
+    }
+}
+
+/// The auto-mount service remounts its drives when write mode changes;
+/// waits until they show up in the new mode.
+fn wait_for_mode(write: bool) {
+    let Ok(l) = Launcher::load() else { return };
+    let mismatched = || -> Vec<String> {
+        l.running()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(c, _)| c == CLASS)
+            .map(|(_, i)| i)
+            .filter(|i| l.info(CLASS, i).is_ok_and(|info| info.iter().any(|s| s.contains("mode=write")) != write))
+            .collect()
+    };
+    if mismatched().is_empty() {
+        return;
+    }
+    println!("mounting your Mac drive again{}...", if write { ", writable (it is checked first; about half a minute)" } else { ", read-only" });
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_secs(240) {
+        std::thread::sleep(Duration::from_secs(1));
+        let shown: Vec<String> =
+            l.running().unwrap_or_default().into_iter().filter(|(c, _)| c == CLASS).map(|(_, i)| i).collect();
+        if mismatched().is_empty() && shown.iter().all(|i| Path::new(&format!("{i}:\\")).exists()) {
+            for i in shown {
+                println!("{i}: is back, {}", if write { "writable" } else { "read-only" });
+            }
+            return;
+        }
+    }
+    println!("still working on it; the drive shows up when ready (details in {})", install_dir().join("automount.log").display());
+}
+
+/// Mounts the Mac drives shown now again in `mode`, so a change of write
+/// mode applies at once (when the auto-mount service is not running).
+fn remount_all(mode: MountMode) {
+    let Ok(l) = Launcher::load() else { return };
+    let running: Vec<String> =
+        l.running().unwrap_or_default().into_iter().filter(|(c, _)| c == CLASS).map(|(_, i)| i).collect();
+    for inst in running {
+        let Some(disk) = l.info(CLASS, &inst).ok().and_then(|info| {
+            info.iter().find_map(|s| s.split(' ').find_map(|t| t.trim_matches('"').strip_prefix("src=").map(str::to_string)))
+        }) else {
+            continue;
+        };
+        println!("remounting {inst}: ({disk})");
+        let _ = l.stop(CLASS, &inst);
+        // Until the old instance is gone: a writable mount checks the drive as it stops.
+        let t = Instant::now();
+        while running_here(&l, &inst) && t.elapsed() < Duration::from_secs(180) {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        if let Err(e) = mount(&disk, &format!("{inst}:"), 0, None, mode) {
+            println!("could not remount {inst}: {}", e.msg);
+        }
+    }
+}
+
 /// `winapfs mount <disk> <X:>` through the launcher.
-pub fn mount(src: &str, mount_point: &str, vol: usize, part: Option<u32>) -> CliResult {
+pub fn mount(src: &str, mount_point: &str, vol: usize, part: Option<u32>, mode: MountMode) -> CliResult {
     let mut disk = disk_source(src).ok_or_else(|| CliError::new("the launcher can only mount whole disks (diskN)"))?;
     if disk == "auto" {
         // Resolve here, so the mount's command line names the disk (the auto-mount service relies on it).
@@ -471,20 +576,25 @@ pub fn mount(src: &str, mount_point: &str, vol: usize, part: Option<u32>) -> Cli
     if let Some(p) = part {
         args.push(format!("part={p}"));
     }
+    if let Some(m) = mode.arg() {
+        args.push(m.to_string());
+    }
     l.start(CLASS, &inst, &args).map_err(|e| CliError::new(e.to_string()))?;
 
     let log = install_dir().join("serve.log");
     let started = Instant::now();
     while !Path::new(&root).exists() {
         let gone = started.elapsed() > Duration::from_secs(2) && !running_here(&l, &inst);
-        if gone || started.elapsed() > Duration::from_secs(45) {
+        // Writable mounts check the whole space map first.
+        let limit = if mode == MountMode::ReadOnly { 45 } else { 300 };
+        if gone || started.elapsed() > Duration::from_secs(limit) {
             let _ = l.stop(CLASS, &inst);
             return Err(CliError::new(format!("winapfs could not mount {disk} at {inst}:"))
                 .hint(format!("details in {}", log.display())));
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    println!("mounted   {disk} volume {vol} at {inst}:, read-only, visible in Explorer");
+    println!("mounted   {disk} volume {vol} at {inst}:, {}, visible in Explorer", mode.describe());
     println!("stop      winapfs unmount {inst}:");
     println!("note      {WINFSP_NOTICE}");
     Ok(())
@@ -560,13 +670,15 @@ pub fn list() -> CliResult {
 /// whole disks (not files the caller may be unable to read) and drive
 /// letters (not folders, which would be created with SYSTEM's rights).
 pub fn serve(args: &[String]) -> CliResult {
-    let (mut src, mut at, mut vol, mut part) = (None, None, 0usize, None);
+    let (mut src, mut at, mut vol, mut part, mut mode) = (None, None, 0usize, None, MountMode::ReadOnly);
     for a in args {
         match a.split_once('=') {
             Some(("src", v)) => src = Some(v.to_string()),
             Some(("at", v)) => at = Some(v.to_string()),
             Some(("vol", v)) => vol = v.parse().map_err(|_| CliError::new(format!("bad vol={v}")))?,
             Some(("part", v)) => part = Some(v.parse().map_err(|_| CliError::new(format!("bad part={v}")))?),
+            Some(("mode", "write")) => mode = MountMode::Write,
+            Some(("mode", "rehearse")) => mode = MountMode::Rehearse,
             _ => {} // the launcher may pass the instance name or empty placeholders
         }
     }
@@ -576,10 +688,10 @@ pub fn serve(args: &[String]) -> CliResult {
         return Err(CliError::new(format!("serve mounts only at drive letters, not {at}")));
     }
     match src.as_str() {
-        "demo" => cmd_mount(None, &at, 0, None),
+        "demo" => cmd_mount(None, &at, 0, None, MountMode::ReadOnly),
         _ => {
             let disk = disk_source(&src).ok_or_else(|| CliError::new(format!("serve reads only whole disks, not {src}")))?;
-            cmd_mount(Some(&disk), &at, vol, part)
+            cmd_mount(Some(&disk), &at, vol, part, mode)
         }
     }
 }

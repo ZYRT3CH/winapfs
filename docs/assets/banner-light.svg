@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 420" width="1280" height="420" role="img" aria-label="winapfs: your Mac drive, on Windows. Read it. Write it. Just plug it in.">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f8faff"/>
+      <stop offset="1" stop-color="#f1ecff"/>
+    </linearGradient>
+    <linearGradient id="ink" x1="0" y1="0" x2="1" y2="0" spreadMethod="reflect">
+      <stop offset="0" stop-color="#0891b2"/>
+      <stop offset="0.45" stop-color="#7c3aed"/>
+      <stop offset="1" stop-color="#db2777"/>
+      <animateTransform attributeName="gradientTransform" type="translate" values="0 0; 0.6 0; 0 0" dur="9s" repeatCount="indefinite"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0891b2"/>
+      <stop offset="0.5" stop-color="#7c3aed"/>
+      <stop offset="1" stop-color="#db2777"/>
+    </linearGradient>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#e9e7fb"/>
+    </linearGradient>
+    <radialGradient id="glowA"><stop offset="0" stop-color="#22d3ee" stop-opacity="0.30"/><stop offset="1" stop-color="#06b6d4" stop-opacity="0"/></radialGradient>
+    <radialGradient id="glowB"><stop offset="0" stop-color="#a78bfa" stop-opacity="0.32"/><stop offset="1" stop-color="#8b5cf6" stop-opacity="0"/></radialGradient>
+    <radialGradient id="glowC"><stop offset="0" stop-color="#f472b6" stop-opacity="0.22"/><stop offset="1" stop-color="#ec4899" stop-opacity="0"/></radialGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="#312e81" stroke-opacity="0.05" stroke-width="1"/>
+    </pattern>
+    <g id="file">
+      <path d="M0 0h26l12 12v34a4 4 0 0 1-4 4H0a4 4 0 0 1-4-4V4a4 4 0 0 1 4-4z" fill="#ffffff" stroke="#c4b5fd" stroke-width="1.5"/>
+      <path d="M26 0v8a4 4 0 0 0 4 4h8" fill="none" stroke="#c4b5fd" stroke-width="2"/>
+      <rect x="4" y="22" width="22" height="3" rx="1.5" fill="#a78bfa"/>
+      <rect x="4" y="30" width="28" height="3" rx="1.5" fill="#67e8f9"/>
+      <rect x="4" y="38" width="16" height="3" rx="1.5" fill="#f9a8d4"/>
+    </g>
+  </defs>
+
+  <rect width="1280" height="420" rx="28" fill="url(#bg)"/>
+  <rect width="1280" height="420" rx="28" fill="url(#grid)"/>
+  <circle cx="240" cy="70" r="330" fill="url(#glowA)">
+    <animate attributeName="cx" values="240;300;240" dur="14s" repeatCount="indefinite"/>
+  </circle>
+  <circle cx="1080" cy="360" r="380" fill="url(#glowB)">
+    <animate attributeName="cy" values="360;320;360" dur="12s" repeatCount="indefinite"/>
+  </circle>
+  <circle cx="820" cy="30" r="240" fill="url(#glowC)">
+    <animate attributeName="cx" values="820;760;820" dur="16s" repeatCount="indefinite"/>
+  </circle>
+
+  <g font-family="Segoe UI, -apple-system, BlinkMacSystemFont, Inter, Helvetica, Arial, sans-serif">
+    <text x="76" y="196" font-size="128" font-weight="800" letter-spacing="-4" fill="url(#ink)" textLength="470" lengthAdjust="spacingAndGlyphs">winapfs</text>
+    <text x="82" y="256" font-size="38" font-weight="650" fill="#0f172a">Your Mac drive, on Windows.</text>
+    <text x="82" y="298" font-size="27" font-weight="400" fill="#475569">Read it. Write it. Just plug it in.</text>
+    <g font-size="17" font-weight="600" fill="#334155">
+      <rect x="82" y="330" width="78" height="34" rx="17" fill="#ffffff" fill-opacity="0.75" stroke="#312e81" stroke-opacity="0.14"/>
+      <text x="121" y="352" text-anchor="middle">APFS</text>
+      <rect x="172" y="330" width="150" height="34" rx="17" fill="#7c3aed" fill-opacity="0.10" stroke="#7c3aed" stroke-opacity="0.45"/>
+      <text x="247" y="352" text-anchor="middle" fill="#5b21b6">Read + Write</text>
+      <rect x="334" y="330" width="184" height="34" rx="17" fill="#ffffff" fill-opacity="0.75" stroke="#312e81" stroke-opacity="0.14"/>
+      <text x="426" y="352" text-anchor="middle">Free &amp; open source</text>
+      <rect x="530" y="330" width="138" height="34" rx="17" fill="#ffffff" fill-opacity="0.75" stroke="#312e81" stroke-opacity="0.14"/>
+      <text x="599" y="352" text-anchor="middle">Made in Rust</text>
+    </g>
+  </g>
+
+  <!-- Files floating into the drive -->
+  <g opacity="0">
+    <use href="#file"/>
+    <animateMotion path="M720 150 C 800 90, 880 110, 950 190" dur="4.5s" repeatCount="indefinite" rotate="auto"/>
+    <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.15;0.75;1" dur="4.5s" repeatCount="indefinite"/>
+  </g>
+  <g opacity="0">
+    <use href="#file"/>
+    <animateMotion path="M700 280 C 780 240, 870 230, 950 220" dur="4.5s" begin="1.5s" repeatCount="indefinite" rotate="auto"/>
+    <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.15;0.75;1" dur="4.5s" begin="1.5s" repeatCount="indefinite"/>
+  </g>
+  <g opacity="0">
+    <use href="#file"/>
+    <animateMotion path="M740 60 C 820 60, 900 120, 955 205" dur="4.5s" begin="3s" repeatCount="indefinite" rotate="auto"/>
+    <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.15;0.75;1" dur="4.5s" begin="3s" repeatCount="indefinite"/>
+  </g>
+
+  <!-- The drive -->
+  <g transform="translate(1000 70) rotate(-8 110 150)">
+    <rect x="6" y="14" width="220" height="296" rx="34" fill="#4c1d95" fill-opacity="0.12"/>
+    <rect width="220" height="296" rx="34" fill="url(#body)" stroke="url(#edge)" stroke-width="3"/>
+    <rect x="22" y="22" width="176" height="252" rx="22" fill="none" stroke="#312e81" stroke-opacity="0.10"/>
+    <text x="110" y="168" text-anchor="middle" font-family="Segoe UI, -apple-system, Helvetica, Arial, sans-serif" font-size="30" font-weight="800" letter-spacing="2" fill="url(#ink)">APFS</text>
+    <rect x="70" y="250" width="80" height="6" rx="3" fill="#312e81" fill-opacity="0.12"/>
+    <circle cx="110" cy="42" r="6" fill="#10b981">
+      <animate attributeName="opacity" values="1;0.25;1" dur="1.2s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="110" cy="42" r="14" fill="#10b981" fill-opacity="0.25">
+      <animate attributeName="r" values="8;18;8" dur="1.2s" repeatCount="indefinite"/>
+      <animate attributeName="fill-opacity" values="0.35;0;0.35" dur="1.2s" repeatCount="indefinite"/>
+    </circle>
+  </g>
+</svg>
