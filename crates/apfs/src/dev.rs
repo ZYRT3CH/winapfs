@@ -29,6 +29,11 @@ impl FileDevice {
     pub fn with_base(&self, base: u64) -> Result<Self> {
         Ok(Self { file: self.file.try_clone()?, base })
     }
+
+    /// Another handle to the same file and base.
+    pub fn try_clone(&self) -> Result<Self> {
+        self.with_base(self.base)
+    }
 }
 
 impl BlockDevice for FileDevice {
@@ -124,6 +129,122 @@ fn pwrite_all(file: &File, mut off: u64, mut buf: &[u8]) -> Result<()> {
 fn pwrite_all(file: &File, off: u64, buf: &[u8]) -> Result<()> {
     use std::os::unix::fs::FileExt;
     Ok(file.write_all_at(buf, off)?)
+}
+
+/// A raw disk (`\\.\PhysicalDriveN`) opened for writing, addressed from the
+/// start of a partition. Only [`crate::write::Writer::open_real_disk`]
+/// creates one, after checking the container's identity.
+pub struct DiskFile {
+    file: File,
+    base: u64,
+}
+
+impl DiskFile {
+    pub(crate) fn open_rw(path: &Path, base: u64) -> Result<Self> {
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        Ok(Self { file, base })
+    }
+}
+
+impl BlockDevice for DiskFile {
+    fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<()> {
+        pread_exact(&self.file, self.base + off, buf)
+    }
+}
+
+impl WriteDevice for DiskFile {
+    fn write_at(&self, off: u64, buf: &[u8]) -> Result<()> {
+        pwrite_all(&self.file, self.base + off, buf)
+    }
+
+    fn flush(&self) -> Result<()> {
+        Ok(self.file.sync_all()?)
+    }
+}
+
+/// A device whose writes are kept in memory: reads see them, the device
+/// underneath never does. Runs the write code against a real disk without
+/// changing it (a rehearsal).
+pub struct Overlay {
+    base: Box<dyn BlockDevice>,
+    bs: u64,
+    blocks: std::sync::Mutex<std::collections::HashMap<u64, Box<[u8]>>>,
+}
+
+impl Overlay {
+    pub fn new(base: Box<dyn BlockDevice>, block_size: u64) -> Self {
+        Self { base, bs: block_size, blocks: Default::default() }
+    }
+
+    /// How many blocks have been written.
+    pub fn written(&self) -> usize {
+        self.blocks.lock().unwrap().len()
+    }
+}
+
+impl BlockDevice for Overlay {
+    fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<()> {
+        let bs = self.bs;
+        let blocks = self.blocks.lock().unwrap();
+        let end = off + buf.len() as u64;
+        // Walk block by block, reading runs of unwritten blocks from the base in one go.
+        let mut b = off / bs;
+        while b * bs < end {
+            let (s, e) = ((b * bs).max(off), ((b + 1) * bs).min(end));
+            if let Some(data) = blocks.get(&b) {
+                buf[(s - off) as usize..(e - off) as usize].copy_from_slice(&data[(s - b * bs) as usize..(e - b * bs) as usize]);
+                b += 1;
+                continue;
+            }
+            let mut last = b;
+            while (last + 1) * bs < end && !blocks.contains_key(&(last + 1)) {
+                last += 1;
+            }
+            let mut tmp = vec![0u8; ((last - b + 1) * bs) as usize];
+            self.base.read_at(b * bs, &mut tmp)?;
+            let e = ((last + 1) * bs).min(end);
+            buf[(s - off) as usize..(e - off) as usize].copy_from_slice(&tmp[(s - b * bs) as usize..(e - b * bs) as usize]);
+            b = last + 1;
+        }
+        Ok(())
+    }
+}
+
+impl WriteDevice for Overlay {
+    fn write_at(&self, off: u64, buf: &[u8]) -> Result<()> {
+        let bs = self.bs;
+        if off % bs != 0 || buf.len() as u64 % bs != 0 {
+            return Err(crate::error::corrupt(format!("unaligned write at {off:#x}+{}", buf.len())));
+        }
+        let mut blocks = self.blocks.lock().unwrap();
+        for (i, chunk) in buf.chunks(bs as usize).enumerate() {
+            blocks.insert(off / bs + i as u64, chunk.into());
+        }
+        Ok(())
+    }
+
+    fn flush(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Lets several owners share one device.
+pub struct Shared<T>(pub std::sync::Arc<T>);
+
+impl<T: BlockDevice> BlockDevice for Shared<T> {
+    fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<()> {
+        self.0.read_at(off, buf)
+    }
+}
+
+impl<T: WriteDevice> WriteDevice for Shared<T> {
+    fn write_at(&self, off: u64, buf: &[u8]) -> Result<()> {
+        self.0.write_at(off, buf)
+    }
+
+    fn flush(&self) -> Result<()> {
+        self.0.flush()
+    }
 }
 
 /// In-memory device, used by tests.

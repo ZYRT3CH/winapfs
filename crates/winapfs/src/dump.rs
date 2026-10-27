@@ -8,7 +8,7 @@ use apfs::obj::ObjHeader;
 use apfs::spaceman::{self, Spaceman};
 use apfs::{checksum, format_uuid, Container};
 
-use crate::{open_source, CliResult};
+use crate::{open_source, CliError, CliResult};
 
 pub fn dump(src: &str, part: Option<u32>) -> CliResult {
     let (c, location) = open_source(src, part)?;
@@ -384,4 +384,291 @@ impl NodeSource for NodeReader<'_> {
     fn read_node(&self, paddr: u64) -> apfs::Result<std::sync::Arc<btree::Node>> {
         self.0.node(paddr)
     }
+}
+
+/// `dev-omap-check`: object-map nodes holding keys newer than the node itself.
+pub fn omap_check(src: &str, part: Option<u32>) -> CliResult {
+    let (c, _) = open_source(src, part)?;
+    omap_nodes(&c, "container", c.sb.omap_oid)?;
+    for v in c.volume_superblocks()? {
+        omap_nodes(&c, &format!("volume \"{}\"", v.name), v.omap_oid)?;
+    }
+    Ok(())
+}
+
+fn omap_nodes(c: &Container, name: &str, omap_paddr: u64) -> CliResult {
+    let phys = c.raw_block(omap_paddr)?;
+    let omap_xid = ObjHeader::parse(&phys)?.xid;
+    let root_paddr = u64::from_le_bytes(phys[48..56].try_into().unwrap());
+    let root = c.node(root_paddr)?;
+    let info = root.info()?;
+    let (mut nodes, mut odd) = (0, 0);
+    let mut stack = vec![(root_paddr, 0u64)];
+    while let Some((p, parent)) = stack.pop() {
+        let n = c.node(p)?;
+        nodes += 1;
+        let entries = n.all_entries(&info)?;
+        let max_key_xid = entries.iter().map(|(k, _)| u64::from_le_bytes(k[8..16].try_into().unwrap())).max().unwrap_or(0);
+        if max_key_xid > n.hdr.xid {
+            odd += 1;
+            println!(
+                "  {name}: node {p:#x} (parent {parent:#x}) level {} xid {} holds key xid {max_key_xid} ({} keys)",
+                n.level,
+                n.hdr.xid,
+                entries.len()
+            );
+        }
+        if !n.is_leaf() {
+            for (_, v) in entries {
+                stack.push((u64::from_le_bytes(v.unwrap_or_default()[0..8].try_into().unwrap()), p));
+            }
+        }
+    }
+    println!("{name} object map at {omap_paddr:#x} (xid {omap_xid}), root {root_paddr:#x} (xid {}): {nodes} nodes, {odd} with newer keys", root.hdr.xid);
+    Ok(())
+}
+
+/// One owner per block, remembering which kind of thing claimed it first.
+struct Claims {
+    owner: Vec<u8>,
+    kinds: Vec<&'static str>,
+    overlaps: Vec<(u64, &'static str, &'static str)>,
+    overlap_count: u64,
+}
+
+impl Claims {
+    fn new(blocks: u64) -> Self {
+        Self { owner: vec![0; blocks as usize], kinds: vec![""], overlaps: Vec::new(), overlap_count: 0 }
+    }
+
+    fn kind(&mut self, k: &'static str) -> u8 {
+        match self.kinds.iter().position(|&x| x == k) {
+            Some(i) => i as u8,
+            None => {
+                self.kinds.push(k);
+                (self.kinds.len() - 1) as u8
+            }
+        }
+    }
+
+    fn claim(&mut self, start: u64, len: u64, k: &'static str) {
+        let id = self.kind(k);
+        for b in start..(start + len).min(self.owner.len() as u64) {
+            let prev = self.owner[b as usize];
+            if prev != 0 && prev != id {
+                self.overlap_count += 1;
+                if self.overlaps.len() < 10 {
+                    self.overlaps.push((b, self.kinds[prev as usize], k));
+                }
+            } else {
+                self.owner[b as usize] = id;
+            }
+        }
+    }
+}
+
+/// Every node of a physical B-tree.
+fn physical_tree_nodes(c: &Container, root_paddr: u64) -> apfs::Result<Vec<u64>> {
+    let root = c.node(root_paddr)?;
+    let info = root.info()?;
+    let mut out = Vec::new();
+    let mut stack = vec![root_paddr];
+    while let Some(p) = stack.pop() {
+        out.push(p);
+        let n = c.node(p)?;
+        if !n.is_leaf() {
+            for (_, v) in n.all_entries(&info)? {
+                stack.push(u64::from_le_bytes(v.unwrap_or_default()[0..8].try_into().unwrap()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `dev-space-check`: rebuilds which blocks are in use from everything that
+/// points at blocks, and compares with the space manager's bitmaps. A block
+/// in use but marked free would later be handed out again: data loss.
+pub fn space_check(src: &str, part: Option<u32>) -> CliResult {
+    let (c, location) = open_source(src, part)?;
+    space_check_container(&c, &location)
+}
+
+/// [`space_check`] on an open container.
+pub fn space_check_container(c: &Container, location: &str) -> CliResult {
+    let n = c.sb.block_count;
+    let bs = c.block_size() as u64;
+    let sm = c.space_manager()?;
+    println!("space check  {location}  xid {}", c.xid());
+
+    // The internal pool (where the space manager keeps chunk bitmaps and
+    // chunk-info blocks) has its own bitmap, in one or more ring blocks.
+    let mut ip_bitmap = Vec::new();
+    for index in sm.ip_bitmap_indices()? {
+        ip_bitmap.extend(c.raw_block(sm.ip_bm_base + index as u64)?);
+    }
+    let ip_marked = |p: u64| {
+        let i = p.wrapping_sub(sm.ip_base);
+        i < sm.ip_block_count && ip_bitmap[(i / 8) as usize] >> (i % 8) & 1 == 1
+    };
+    let mut ip_used = std::collections::HashSet::new();
+    let mut ip_problems = Vec::new();
+
+    // What the bitmaps say, chunk by chunk, with the free counts checked.
+    let mut marked = vec![false; n as usize];
+    let (mut free_total, mut bad_counts) = (0u64, 0u64);
+    for cib in sm.dev_addrs(spaceman::SD_MAIN)? {
+        if !ip_marked(cib) {
+            ip_problems.push(format!("chunk-info block {cib:#x} is free in the internal-pool bitmap"));
+        }
+        ip_used.insert(cib);
+        let (_, chunks) = spaceman::chunk_infos(&c.raw_block(cib)?)?;
+        for ch in chunks {
+            if ch.bitmap_addr != 0 {
+                if !ip_marked(ch.bitmap_addr) {
+                    ip_problems.push(format!("chunk bitmap {:#x} is free in the internal-pool bitmap", ch.bitmap_addr));
+                }
+                if !ip_used.insert(ch.bitmap_addr) {
+                    ip_problems.push(format!("internal-pool block {:#x} used twice", ch.bitmap_addr));
+                }
+            }
+            let mut zeros = ch.block_count as u64;
+            if ch.bitmap_addr != 0 {
+                let bm = c.raw_block(ch.bitmap_addr)?;
+                for i in 0..ch.block_count as u64 {
+                    if bm[(i / 8) as usize] >> (i % 8) & 1 == 1 {
+                        marked[(ch.addr + i) as usize] = true;
+                        zeros -= 1;
+                    }
+                }
+            }
+            if zeros != ch.free_count as u64 {
+                bad_counts += 1;
+            }
+            free_total += zeros;
+        }
+    }
+    // Internal-pool blocks waiting in their free queue stay marked too.
+    let resolve_ip =
+        |oid: u64| c.ephemeral_paddr(oid).ok_or_else(|| apfs::Error::Corrupt(format!("ephemeral node {oid:#x} not in checkpoint")));
+    if let Some(root_paddr) = c.ephemeral_paddr(sm.fq[spaceman::SFQ_IP].tree_oid) {
+        let root = c.node(root_paddr)?;
+        let info = root.info()?;
+        btree::scan_with_ghosts(&NodeReader(&c), &root, &info, &resolve_ip, &mut |k, v| {
+            let paddr = u64::from_le_bytes(k[8..16].try_into().unwrap());
+            let count = v.map_or(1, |v| u64::from_le_bytes(v[0..8].try_into().unwrap()));
+            for p in paddr..paddr + count {
+                if !ip_marked(p) {
+                    ip_problems.push(format!("queued internal-pool block {p:#x} is already free"));
+                }
+                if !ip_used.insert(p) {
+                    ip_problems.push(format!("internal-pool block {p:#x} queued but still in use"));
+                }
+            }
+            Ok(true)
+        })?;
+    }
+    let ip_leaked = (0..sm.ip_block_count).filter(|&i| ip_marked(sm.ip_base + i) && !ip_used.contains(&(sm.ip_base + i))).count();
+    println!(
+        "internal pool  {} blocks in use, {ip_leaked} marked but unused, {} problems",
+        ip_used.len(),
+        ip_problems.len()
+    );
+    for p in ip_problems.iter().take(10) {
+        println!("  {p}");
+    }
+
+    let dev_free = sm.dev[spaceman::SD_MAIN].free_count;
+    println!(
+        "bitmaps    {free_total} blocks free; chunks with a wrong free count: {bad_counts}; device free count {dev_free} ({})",
+        if free_total == dev_free { "matches" } else { "DOES NOT MATCH" }
+    );
+
+    // Everything that points at main-device blocks.
+    let mut claims = Claims::new(n);
+    claims.claim(0, 1, "container superblock");
+    claims.claim(c.sb.xp_desc_base, (c.sb.xp_desc_blocks & 0x7fff_ffff) as u64, "checkpoint descriptor area");
+    claims.claim(c.sb.xp_data_base, (c.sb.xp_data_blocks & 0x7fff_ffff) as u64, "checkpoint data area");
+    claims.claim(sm.ip_base, sm.ip_block_count, "internal pool");
+    claims.claim(sm.ip_bm_base, sm.ip_bm_block_count as u64, "internal-pool bitmap ring");
+    claims.claim(c.sb.omap_oid, 1, "object map");
+    let nx_omap_root = u64::from_le_bytes(c.raw_block(c.sb.omap_oid)?[48..56].try_into().unwrap());
+    for p in physical_tree_nodes(&c, nx_omap_root)? {
+        claims.claim(p, 1, "object map node");
+    }
+    for (_, _, v) in c.omap_entries()? {
+        claims.claim(v.paddr, 1, "volume superblock");
+    }
+    for (i, vsb) in c.volume_superblocks()?.iter().enumerate() {
+        let v = c.volume(i)?;
+        claims.claim(vsb.omap_oid, 1, "object map");
+        let root = u64::from_le_bytes(c.raw_block(vsb.omap_oid)?[48..56].try_into().unwrap());
+        for p in physical_tree_nodes(&c, root)? {
+            claims.claim(p, 1, "object map node");
+        }
+        for (_, _, val) in v.omap_entries()? {
+            claims.claim(val.paddr, 1, "file-system tree node");
+        }
+        for p in physical_tree_nodes(&c, vsb.extentref_tree_oid)? {
+            claims.claim(p, 1, "extent-reference tree node");
+        }
+        if vsb.snap_meta_tree_oid != 0 {
+            for p in physical_tree_nodes(&c, vsb.snap_meta_tree_oid)? {
+                claims.claim(p, 1, "snapshot tree node");
+            }
+        }
+        v.scan_all(&mut |k, val| {
+            if u64::from_le_bytes(k[0..8].try_into().unwrap()) >> 60 == 8 && val.len() >= 16 {
+                let len = u64::from_le_bytes(val[0..8].try_into().unwrap()) & 0x00ff_ffff_ffff_ffff;
+                let phys = u64::from_le_bytes(val[8..16].try_into().unwrap());
+                if phys != 0 {
+                    claims.claim(phys, len.div_ceil(bs), "file data");
+                }
+            }
+            Ok(true)
+        })?;
+    }
+    // Blocks waiting in the main free queue stay allocated until released.
+    let resolve =
+        |oid: u64| c.ephemeral_paddr(oid).ok_or_else(|| apfs::Error::Corrupt(format!("ephemeral node {oid:#x} not in checkpoint")));
+    let mut queued = Vec::new();
+    if let Some(root_paddr) = c.ephemeral_paddr(sm.fq[spaceman::SFQ_MAIN].tree_oid) {
+        let root = c.node(root_paddr)?;
+        let info = root.info()?;
+        btree::scan_with_ghosts(&NodeReader(&c), &root, &info, &resolve, &mut |k, v| {
+            let paddr = u64::from_le_bytes(k[8..16].try_into().unwrap());
+            let count = v.map_or(1, |v| u64::from_le_bytes(v[0..8].try_into().unwrap()));
+            queued.push((paddr, count));
+            Ok(true)
+        })?;
+    }
+    for (p, count) in queued {
+        claims.claim(p, count, "free queue (pending release)");
+    }
+
+    // Compare.
+    let mut in_use_but_free: std::collections::BTreeMap<&str, (u64, u64)> = Default::default();
+    let mut leaked = 0u64;
+    for b in 0..n {
+        let owner = claims.owner[b as usize];
+        if owner != 0 && !marked[b as usize] {
+            in_use_but_free.entry(claims.kinds[owner as usize]).or_insert((0, b)).0 += 1;
+        } else if owner == 0 && marked[b as usize] {
+            leaked += 1;
+        }
+    }
+    println!("overlaps   {} blocks claimed by two different things", claims.overlap_count);
+    for (b, a, k) in &claims.overlaps {
+        println!("  block {b:#x}: {a} and {k}");
+    }
+    let lost: u64 = in_use_but_free.values().map(|v| v.0).sum();
+    println!("in use but marked free: {lost} blocks");
+    for (k, (count, first)) in &in_use_but_free {
+        println!("  {k}: {count} (first at {first:#x})");
+    }
+    println!("allocated but unused (leaked): {leaked} blocks ({})", crate::human_size(leaked * bs));
+    if lost > 0 || claims.overlap_count > 0 || !ip_problems.is_empty() {
+        return Err(CliError::new("the space map is inconsistent"));
+    }
+    println!("result     consistent: nothing in use is marked free, nothing is claimed twice");
+    Ok(())
 }

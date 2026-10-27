@@ -311,10 +311,15 @@ impl Container {
 
     /// Any block, unchecked (block 0 included). For inspection tools.
     pub fn raw_block(&self, paddr: u64) -> Result<Vec<u8>> {
-        if paddr >= self.r.block_count {
-            return Err(corrupt(format!("block address {paddr:#x} outside the container")));
+        self.raw_blocks(paddr, 1)
+    }
+
+    /// `count` consecutive blocks from `paddr`, unchecked.
+    pub fn raw_blocks(&self, paddr: u64, count: u64) -> Result<Vec<u8>> {
+        if paddr.checked_add(count).is_none_or(|end| end > self.r.block_count) {
+            return Err(corrupt(format!("blocks {paddr:#x}+{count} outside the container")));
         }
-        let mut b = vec![0u8; self.r.block_size as usize];
+        let mut b = vec![0u8; (count * self.r.block_size as u64) as usize];
         self.r.read_at(paddr * self.r.block_size as u64, &mut b)?;
         Ok(b)
     }

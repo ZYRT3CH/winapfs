@@ -8,6 +8,8 @@ mod backends;
 mod disks;
 mod dump;
 #[cfg(windows)]
+mod rehearse;
+#[cfg(windows)]
 mod mountfs;
 #[cfg(windows)]
 mod service;
@@ -289,6 +291,30 @@ fn run(a: &Args) -> CliResult {
                 .map_err(|_| CliError::new("id must be a number"))?;
             dump::records(&a.pos[0], id, a.vol, a.part)
         }
+        // dev-restamp <image> <block> <xid>: sets one object's transaction id
+        // and checksum, to normalize test copies; image files only.
+        "dev-restamp" => {
+            need(3)?;
+            let num = |s: &str| u64::from_str_radix(s.trim_start_matches("0x"), if s.starts_with("0x") { 16 } else { 10 });
+            let (paddr, xid) = (num(&a.pos[1]).map_err(|_| CliError::new("bad block"))?, num(&a.pos[2]).map_err(|_| CliError::new("bad xid"))?);
+            let img = apfs::ImageFile::open_rw(Path::new(&a.pos[0]))?;
+            let mut b = vec![0u8; 4096];
+            apfs::BlockDevice::read_at(&img, paddr * 4096, &mut b)?;
+            b[16..24].copy_from_slice(&xid.to_le_bytes());
+            let sum = apfs::checksum::compute(&b);
+            b[0..8].copy_from_slice(&sum.to_le_bytes());
+            apfs::WriteDevice::write_at(&img, paddr * 4096, &b)?;
+            println!("block {paddr:#x} now xid {xid}");
+            Ok(())
+        }
+        "dev-space-check" => {
+            need(1)?;
+            dump::space_check(&a.pos[0], a.part)
+        }
+        "dev-omap-check" => {
+            need(1)?;
+            dump::omap_check(&a.pos[0], a.part)
+        }
         "dev-hash-check" => {
             need(1)?;
             dump::hash_check(&a.pos[0], a.vol, a.part)
@@ -312,7 +338,7 @@ fn run(a: &Args) -> CliResult {
             let kind = if a.cmd == "dev-mkdir" { NewKind::Folder } else { NewKind::File };
             let mut s = Session::open(Path::new(&a.pos[0]), a.vol)?;
             for path in &a.pos[1..] {
-                let (dir, name) = split_path(&s, path)?;
+                let (dir, name) = split_path(&mut s, path)?;
                 let id = s.create(dir, name, kind)?;
                 println!("created {path:?} as inode {id} in xid {}", s.container().xid());
             }
@@ -360,7 +386,7 @@ fn run(a: &Args) -> CliResult {
             need(2)?;
             let mut s = Session::open(Path::new(&a.pos[0]), a.vol)?;
             for path in &a.pos[1..] {
-                let (dir, name) = split_path(&s, path)?;
+                let (dir, name) = split_path(&mut s, path)?;
                 s.remove(dir, name)?;
                 println!("removed {path:?} in xid {}", s.container().xid());
             }
@@ -370,8 +396,8 @@ fn run(a: &Args) -> CliResult {
         "dev-mv" => {
             need(3)?;
             let mut s = Session::open(Path::new(&a.pos[0]), a.vol)?;
-            let (sdir, sname) = split_path(&s, &a.pos[1])?;
-            let (ddir, dname) = split_path(&s, &a.pos[2])?;
+            let (sdir, sname) = split_path(&mut s, &a.pos[1])?;
+            let (ddir, dname) = split_path(&mut s, &a.pos[2])?;
             s.rename(sdir, sname, ddir, dname, a.pos.get(3).is_some_and(|x| x == "replace"))?;
             println!("moved {:?} to {:?} in xid {}", a.pos[1], a.pos[2], s.container().xid());
             Ok(())
@@ -382,44 +408,24 @@ fn run(a: &Args) -> CliResult {
         "dev-script" => {
             need(2)?;
             let mut s = Session::open(Path::new(&a.pos[0]), a.vol)?;
-            for (n, line) in fs::read_to_string(&a.pos[1])?.lines().enumerate() {
-                let w: Vec<&str> = line.split_whitespace().collect();
-                let fail = |e: apfs::Error| CliError::new(format!("line {}: {line}: {e}", n + 1));
-                let id_of = |s: &Session, p: &str| s.volume().and_then(|v| v.lookup_path(p)).map(|i| i.id);
-                match w.as_slice() {
-                    [] => {}
-                    [c, ..] if c.starts_with('#') => {}
-                    ["flush"] => s.flush().map_err(fail)?,
-                    ["mkdir", p] | ["touch", p] => {
-                        let kind = if w[0] == "mkdir" { NewKind::Folder } else { NewKind::File };
-                        let (dir, name) = split_path(&s, p)?;
-                        s.create(dir, name, kind).map_err(fail)?;
-                    }
-                    ["rm", p] => {
-                        let (dir, name) = split_path(&s, p)?;
-                        s.remove(dir, name).map_err(fail)?;
-                    }
-                    ["mv", from, to, rest @ ..] => {
-                        let (sdir, sname) = split_path(&s, from)?;
-                        let (ddir, dname) = split_path(&s, to)?;
-                        s.rename(sdir, sname, ddir, dname, rest == ["replace"]).map_err(fail)?;
-                    }
-                    ["write", p, off, local] => {
-                        let id = id_of(&s, p).map_err(fail)?;
-                        let off: u64 = off.parse().map_err(|_| CliError::new(format!("line {}: bad offset", n + 1)))?;
-                        s.write(id, off, &fs::read(local)?).map_err(fail)?;
-                    }
-                    ["size", p, size] => {
-                        let id = id_of(&s, p).map_err(fail)?;
-                        let size: u64 = size.parse().map_err(|_| CliError::new(format!("line {}: bad size", n + 1)))?;
-                        s.set_size(id, size).map_err(fail)?;
-                    }
-                    _ => return Err(CliError::new(format!("line {}: cannot parse {line:?}", n + 1))),
-                }
-            }
-            s.flush()?;
+            run_script(&mut s, &a.pos[1])?;
             println!("script done, xid {}", s.container().xid());
             Ok(())
+        }
+        // dev-rehearse <source> <script> [metadata-folder]: runs a write script
+        // against a real disk with every write kept in memory; nothing is written.
+        "dev-rehearse" => {
+            need(2)?;
+            rehearse::run(&a.pos[0], &a.pos[1], a.vol, a.part, a.pos.get(2).map(Path::new))
+        }
+        // dev-real-write <source> <script> <container-uuid> <undo-file>: see rehearse.rs.
+        "dev-real-write" => {
+            need(4)?;
+            rehearse::real_write(&a.pos[0], &a.pos[1], &a.pos[2], Path::new(&a.pos[3]), a.vol, a.part)
+        }
+        "dev-undo" => {
+            need(2)?;
+            rehearse::undo(&a.pos[0], Path::new(&a.pos[1]), a.part)
         }
         "dev-rename" => {
             need(2)?;
@@ -432,15 +438,15 @@ fn run(a: &Args) -> CliResult {
 }
 
 /// Splits a path in an image into its folder's inode number and the last name.
-fn split_path<'p>(s: &Session, path: &'p str) -> Result<(u64, &'p str), CliError> {
+fn split_path<'p>(s: &mut Session, path: &'p str) -> Result<(u64, &'p str), CliError> {
     let path = path.trim_end_matches('/');
     let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
-    Ok((s.volume()?.lookup_path(dir)?.id, name))
+    Ok((s.lookup_path(dir)?, name))
 }
 
 /// Creates (or truncates) the file at `dest` and copies `src` into it.
 fn dev_put(s: &mut Session, src: &mut File, dest: &str) -> Result<u64, CliError> {
-    let existing = s.volume()?.lookup_path(dest).ok().map(|i| i.id);
+    let existing = s.lookup_path(dest).ok();
     let id = match existing {
         Some(id) => id,
         None => {
@@ -486,6 +492,13 @@ fn find_apfs_disk() -> CliResult<String> {
 }
 
 fn open_source(src: &str, part: Option<u32>) -> CliResult<(Container, String)> {
+    let (dev, location, ..) = open_device(src, part)?;
+    Ok((Container::open(Box::new(dev))?, location))
+}
+
+/// Opens a source read-only, addressed from the start of its APFS container.
+/// Also returns the device path and the container's byte offset in it.
+fn open_device(src: &str, part: Option<u32>) -> CliResult<(FileDevice, String, String, u64)> {
     let found;
     let src = if src.eq_ignore_ascii_case("auto") {
         found = find_apfs_disk()?;
@@ -504,8 +517,8 @@ fn open_source(src: &str, part: Option<u32>) -> CliResult<(Container, String)> {
         }
         _ => e.into(),
     })?;
-    let (dev, location) = match gpt::read_partitions(&dev)? {
-        None => (dev, path.clone()),
+    let (dev, location, base) = match gpt::read_partitions(&dev)? {
+        None => (dev, path.clone(), 0),
         Some(parts) => {
             let chosen = match part {
                 Some(n) => parts.iter().find(|p| p.number == n),
@@ -519,10 +532,10 @@ fn open_source(src: &str, part: Option<u32>) -> CliResult<(Container, String)> {
                 return Err(CliError::new(format!("no matching APFS partition on {path}"))
                     .hint(format!("partitions: {}", list.join(", "))));
             };
-            (dev.with_base(p.offset)?, format!("{path} partition {}", p.number))
+            (dev.with_base(p.offset)?, format!("{path} partition {}", p.number), p.offset)
         }
     };
-    Ok((Container::open(Box::new(dev))?, location))
+    Ok((dev, location, path, base))
 }
 
 fn cmd_info(src: &str, part: Option<u32>) -> CliResult {
@@ -1012,4 +1025,61 @@ mod tests {
         assert_eq!(format_time(0), "1970-01-01 00:00");
         assert_eq!(format_time(1_700_000_000 * 1_000_000_000), "2023-11-14 22:13");
     }
+}
+
+/// Runs a write script (see `dev-script`) in a session, flushes it, then
+/// runs its `check` lines against what was committed.
+fn run_script(s: &mut Session, script: &str) -> CliResult {
+    let text = fs::read_to_string(script)?;
+    let mut checks = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let w: Vec<&str> = line.split_whitespace().collect();
+        let fail = |e: apfs::Error| CliError::new(format!("line {}: {line}: {e}", n + 1));
+        let id_of = |s: &mut Session, p: &str| s.lookup_path(p);
+        match w.as_slice() {
+            [] => {}
+            [c, ..] if c.starts_with('#') => {}
+            ["flush"] => s.flush().map_err(fail)?,
+            ["mkdir", p] | ["touch", p] => {
+                let kind = if w[0] == "mkdir" { NewKind::Folder } else { NewKind::File };
+                let (dir, name) = split_path(s, p)?;
+                s.create(dir, name, kind).map_err(fail)?;
+            }
+            ["rm", p] => {
+                let (dir, name) = split_path(s, p)?;
+                s.remove(dir, name).map_err(fail)?;
+            }
+            ["mv", from, to, rest @ ..] => {
+                let (sdir, sname) = split_path(s, from)?;
+                let (ddir, dname) = split_path(s, to)?;
+                s.rename(sdir, sname, ddir, dname, rest == ["replace"]).map_err(fail)?;
+            }
+            ["write", p, off, local] => {
+                let id = id_of(s, p).map_err(fail)?;
+                let off: u64 = off.parse().map_err(|_| CliError::new(format!("line {}: bad offset", n + 1)))?;
+                s.write(id, off, &fs::read(local)?).map_err(fail)?;
+            }
+            ["size", p, size] => {
+                let id = id_of(s, p).map_err(fail)?;
+                let size: u64 = size.parse().map_err(|_| CliError::new(format!("line {}: bad size", n + 1)))?;
+                s.set_size(id, size).map_err(fail)?;
+            }
+            // check <path> <local file>: after the commit, the file reads back
+            // exactly as the local one.
+            ["check", p, local] => checks.push((n + 1, p.to_string(), local.to_string())),
+            _ => return Err(CliError::new(format!("line {}: cannot parse {line:?}", n + 1))),
+        }
+    }
+    s.flush()?;
+    let v = s.volume()?;
+    for (line, p, local) in checks {
+        let mut got = Vec::new();
+        v.read_file(&v.lookup_path(&p)?, &mut got)?;
+        let want = fs::read(&local)?;
+        if got != want {
+            return Err(CliError::new(format!("line {line}: {p} reads back differently ({} bytes, expected {})", got.len(), want.len())));
+        }
+        println!("  check ok: {p} ({} bytes)", got.len());
+    }
+    Ok(())
 }

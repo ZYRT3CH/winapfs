@@ -41,7 +41,7 @@ pub struct Times {
 
 const XATTR_DATA_STREAM: u16 = 0x1;
 const APFS_TYPE_SIBLING_LINK: u64 = 5;
-const ROOT_DIR_INO: u64 = 2;
+pub(super) const ROOT_DIR_INO: u64 = 2;
 
 /// Reads a volume's file-system tree nodes through its object map.
 pub(super) struct VolReader<'a, 'c>(pub &'a Volume<'c>);
@@ -181,6 +181,15 @@ impl<'a, 'c> VolEdit<'a, 'c> {
 
     /// The directory entry for `name` in `dir`, matched as the volume
     /// compares names: (key, value).
+    /// The inode number of `name` in folder `dir`, if it is there.
+    pub fn lookup(&mut self, dir: u64, name: &str) -> Result<Option<u64>> {
+        match self.find_entry(dir, name)? {
+            Some((_, Some(v))) => Ok(Some(u64_at(&v, 0)?)),
+            Some((_, None)) => Err(corrupt("directory entry without a value")),
+            None => Ok(None),
+        }
+    }
+
     fn find_entry(&mut self, dir: u64, name: &str) -> Result<Option<Entry>> {
         let (lo, hi) = fs::drec_hash_range(dir, name, self.v.sb.is_case_insensitive());
         let want = self.v.name_key(name);
@@ -372,7 +381,12 @@ impl<'a, 'c> VolEdit<'a, 'c> {
             let (rs, re) = (r.lblock * bs, (r.lblock + r.blocks) * bs);
             let (s, e) = (rs.max(off), re.min(end));
             if s < e {
-                c.r.read_at(r.phys * bs + (s - rs), &mut buf[(s - off) as usize..(e - off) as usize])?;
+                // Whole blocks only: raw disks refuse unaligned reads.
+                let (first, last) = ((s - rs) / bs, (e - rs).div_ceil(bs));
+                let mut tmp = vec![0u8; ((last - first) * bs) as usize];
+                c.r.read_at((r.phys + first) * bs, &mut tmp)?;
+                let skip = (s - rs - first * bs) as usize;
+                buf[(s - off) as usize..(e - off) as usize].copy_from_slice(&tmp[skip..skip + (e - s) as usize]);
             }
         }
         Ok(Some(len))

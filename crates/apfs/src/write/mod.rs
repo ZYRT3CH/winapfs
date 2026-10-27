@@ -15,10 +15,11 @@ mod vol;
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::bytes::u64_at;
 use crate::checksum;
-use crate::dev::{FileDevice, ImageFile, WriteDevice};
+use crate::dev::{BlockDevice, DiskFile, FileDevice, ImageFile, Overlay, Shared, WriteDevice};
 use crate::error::{corrupt, unsupported, Error, Result};
 use crate::fs::{Inode, Volume};
 use crate::gpt;
@@ -58,12 +59,15 @@ fn now_ns() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64)
 }
 
-/// An APFS container in an image file, open for writing.
+/// Opens a fresh reader on the device a [`Writer`] writes to.
+type OpenReader = Box<dyn Fn() -> Result<Box<dyn BlockDevice>> + Send + Sync>;
+
+/// An APFS container open for writing: in an image file, or a real disk
+/// seen through an [`Overlay`] that keeps the writes in memory.
 pub struct Writer {
     c: Container,
-    dev: ImageFile,
-    path: std::path::PathBuf,
-    base: u64,
+    dev: Box<dyn WriteDevice>,
+    reader: OpenReader,
 }
 
 /// One transaction: block allocations, new object copies and superblock
@@ -90,8 +94,39 @@ impl Writer {
     pub fn open(path: &Path) -> Result<Self> {
         let base = container_offset(path)?;
         let dev = ImageFile::open_rw(path)?.with_base(base)?;
-        let c = Container::open(Box::new(FileDevice::open(path)?.with_base(base)?))?;
-        Ok(Self { c, dev, path: path.to_path_buf(), base })
+        let path = path.to_path_buf();
+        let reader: OpenReader = Box::new(move || Ok(Box::new(FileDevice::open(&path)?.with_base(base)?)));
+        let c = Container::open(reader()?)?;
+        Ok(Self { c, dev: Box::new(dev), reader })
+    }
+
+    /// Opens the container on a real disk for writing, from byte `base` of
+    /// `path`. Refused unless the container's UUID is `expected_uuid`, so a
+    /// renumbered disk can never be written by mistake.
+    pub fn open_real_disk(path: &Path, base: u64, expected_uuid: [u8; 16]) -> Result<Self> {
+        let read_path = path.to_path_buf();
+        let reader: OpenReader = Box::new(move || Ok(Box::new(FileDevice::open(&read_path)?.with_base(base)?)));
+        let c = Container::open(reader()?)?;
+        if c.sb.uuid != expected_uuid {
+            return Err(unsupported(format!(
+                "container {} is not the one named for writing ({})",
+                crate::format_uuid(&c.sb.uuid),
+                crate::format_uuid(&expected_uuid)
+            )));
+        }
+        let dev = DiskFile::open_rw(path, base)?;
+        Ok(Self { c, dev: Box::new(dev), reader })
+    }
+
+    /// A writer for the container on `base` (a read-only device) whose
+    /// writes stay in the returned overlay: `base` is never written.
+    pub fn rehearsal(base: FileDevice) -> Result<(Self, Arc<Overlay>)> {
+        let bs = Container::open(Box::new(base.try_clone()?))?.block_size() as u64;
+        let ov = Arc::new(Overlay::new(Box::new(base), bs));
+        let shared = Arc::clone(&ov);
+        let reader: OpenReader = Box::new(move || Ok(Box::new(Shared(Arc::clone(&shared)))));
+        let c = Container::open(reader()?)?;
+        Ok((Self { c, dev: Box::new(Shared(Arc::clone(&ov))), reader }, ov))
     }
 
     /// The committed state, as a reader sees it.
@@ -100,7 +135,7 @@ impl Writer {
     }
 
     fn reload(&mut self) -> Result<()> {
-        self.c = Container::open(Box::new(FileDevice::open(&self.path)?.with_base(self.base)?))?;
+        self.c = Container::open((self.reader)()?)?;
         Ok(())
     }
 
@@ -223,7 +258,8 @@ impl Writer {
     /// Returns the transaction id.
     pub fn commit(&mut self, t: Txn) -> Result<u64> {
         let Txn { xid, space, mut writes, nx_omap_oid, next_oid } = t;
-        let ephemeral: HashMap<u64, Vec<u8>> = space.finish(&mut writes)?.into_iter().collect();
+        let (objects, dropped) = space.finish(&mut writes)?;
+        let ephemeral: HashMap<u64, Vec<u8>> = objects.into_iter().collect();
 
         let sb = &self.c.sb;
         if sb.xp_desc_blocks & 0x8000_0000 != 0 || sb.xp_data_blocks & 0x8000_0000 != 0 {
@@ -239,7 +275,7 @@ impl Writer {
         let mut data_pos = data_start;
         let mut eph_writes: Vec<(u64, Vec<u8>)> = Vec::new();
         let mut mappings: Vec<CheckpointMapping> = Vec::new();
-        for m in &self.c.checkpoint_map {
+        for m in self.c.checkpoint_map.iter().filter(|m| !dropped.contains(&m.oid)) {
             let mut obj = match ephemeral.get(&m.oid) {
                 Some(updated) => updated.clone(),
                 None => {
@@ -335,13 +371,29 @@ pub struct Session {
     w: Writer,
     vol: usize,
     open: Option<(Txn, VolState)>,
+    /// Keep every change in one transaction until an explicit flush.
+    batch: bool,
 }
 
 impl Session {
     pub fn open(path: &Path, vol: usize) -> Result<Self> {
         let w = Writer::open(path)?;
         w.c.volume(vol)?;
-        Ok(Self { w, vol, open: None })
+        Ok(Self { w, vol, open: None, batch: false })
+    }
+
+    /// A session on a real disk; see [`Writer::open_real_disk`].
+    pub fn open_real_disk(path: &Path, base: u64, expected_uuid: [u8; 16], vol: usize) -> Result<Self> {
+        let w = Writer::open_real_disk(path, base, expected_uuid)?;
+        w.c.volume(vol)?;
+        Ok(Self { w, vol, open: None, batch: false })
+    }
+
+    /// A session on a real disk whose writes stay in the returned overlay.
+    pub fn rehearsal(base: FileDevice, vol: usize) -> Result<(Self, Arc<Overlay>)> {
+        let (w, ov) = Writer::rehearsal(base)?;
+        w.c.volume(vol)?;
+        Ok((Self { w, vol, open: None, batch: false }, ov))
     }
 
     /// The committed state, as a reader sees it. Files being written read
@@ -384,7 +436,7 @@ impl Session {
         }
         let v = self.w.c.volume(self.vol)?;
         let (t, st) = self.open.as_mut().unwrap();
-        let r = f(&mut VolEdit { v: &v, st }, t, &self.w.dev);
+        let r = f(&mut VolEdit { v: &v, st }, t, &*self.w.dev);
         drop(v);
         if let Err(e) = &r {
             // These are found before anything changes.
@@ -410,8 +462,32 @@ impl Session {
 
     fn edit_and_flush<R>(&mut self, f: impl FnOnce(&mut VolEdit, &mut Txn, &dyn WriteDevice) -> Result<R>) -> Result<R> {
         let r = self.edit(f)?;
-        self.flush()?;
+        if !self.batch {
+            self.flush()?;
+        }
         Ok(r)
+    }
+
+    /// Batch mode: every change stays in one transaction until
+    /// [`Session::flush`]. Until a later transaction runs, nothing the
+    /// previous checkpoint uses has been overwritten.
+    pub fn set_batch(&mut self, batch: bool) {
+        self.batch = batch;
+    }
+
+    /// The inode number at `path`, seeing changes not yet committed.
+    pub fn lookup_path(&mut self, path: &str) -> Result<u64> {
+        if self.open.is_none() {
+            return Ok(self.volume()?.lookup_path(path)?.id);
+        }
+        let comps: Vec<String> = path.split('/').filter(|c| !c.is_empty()).map(str::to_string).collect();
+        self.edit(|e, _, _| {
+            let mut id = vol::ROOT_DIR_INO;
+            for c in &comps {
+                id = e.lookup(id, c)?.ok_or_else(|| Error::NotFound(format!("\"{c}\" in {path}")))?;
+            }
+            Ok(id)
+        })
     }
 
     /// Creates an empty file or folder; returns its inode number.
@@ -468,6 +544,63 @@ impl Session {
         }
         Ok(inode)
     }
+}
+
+/// Writes saved blocks back to the container at byte `base` of `path` (a
+/// disk or an image), for undoing a transaction: `blocks` are (block
+/// address, contents), written in order, then flushed. Refused unless the
+/// container's UUID is `expected_uuid`.
+pub fn restore_blocks(path: &Path, base: u64, expected_uuid: [u8; 16], blocks: &[(u64, Vec<u8>)]) -> Result<()> {
+    let c = Container::open(Box::new(FileDevice::open(path)?.with_base(base)?))?;
+    if c.sb.uuid != expected_uuid {
+        return Err(unsupported(format!("container {} is not the one the undo file belongs to", crate::format_uuid(&c.sb.uuid))));
+    }
+    let bs = c.block_size() as u64;
+    let dev = DiskFile::open_rw(path, base)?;
+    for (paddr, data) in blocks {
+        if data.len() as u64 % bs != 0 || paddr + data.len() as u64 / bs > c.sb.block_count {
+            return Err(corrupt(format!("undo data for block {paddr:#x} does not fit the container")));
+        }
+        dev.write_at(paddr * bs, data)?;
+    }
+    dev.flush()
+}
+
+/// What would stop this crate from writing to container `c`, found by
+/// loading everything a transaction loads (nothing is written). Empty when
+/// writing is possible.
+pub fn check_writable(c: &Container) -> Vec<String> {
+    let mut problems = Vec::new();
+    let sb = &c.sb;
+    if sb.xp_desc_blocks & 0x8000_0000 != 0 || sb.xp_data_blocks & 0x8000_0000 != 0 {
+        problems.push("checkpoint areas are not contiguous".into());
+    }
+    let per_block = (c.block_size() as usize - 40) / 40;
+    if c.checkpoint_map.len() > per_block {
+        problems.push(format!("checkpoint map has {} entries (one block holds {per_block})", c.checkpoint_map.len()));
+    }
+    match Space::load(c, sb.next_xid) {
+        Ok(mut s) => {
+            if let Err(e) = s.release_queued(c) {
+                problems.push(format!("space manager, releasing freed blocks: {e}"));
+            }
+        }
+        Err(e) => problems.push(format!("space manager: {e}")),
+    }
+    for i in 0..sb.fs_oids.len() {
+        match c.volume(i) {
+            Ok(v) => {
+                if let Err(e) = VolState::open(&v) {
+                    problems.push(format!("volume {i} \"{}\": {e}", v.sb.name));
+                }
+                if let Err(e) = Tree::open(&PhysReader(c), v.sb.extentref_tree_oid, fs::key_cmp) {
+                    problems.push(format!("volume {i} \"{}\" extent-reference tree: {e}", v.sb.name));
+                }
+            }
+            Err(e) => problems.push(format!("volume {i}: {e}")),
+        }
+    }
+    problems
 }
 
 /// Records this program in a volume superblock's modification history

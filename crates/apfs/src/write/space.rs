@@ -46,9 +46,12 @@ pub struct Space {
     bitmaps: HashMap<usize, Vec<u8>>,
     dirty_chunks: BTreeSet<usize>,
     ip_bitmap: Vec<u8>,
-    ip_dirty: bool,
+    /// Per bitmap block: changed in this transaction.
+    ip_dirty: Vec<bool>,
     fq: [Vec<FqEntry>; 2],
     fq_roots: [Option<(u32, BTreeInfo)>; 2],
+    /// Object ids of the free-queue trees' non-root nodes.
+    fq_old_nodes: Vec<u64>,
     /// Chunk where the last run was found; earlier ones were full.
     run_hint: usize,
 }
@@ -64,8 +67,8 @@ impl Space {
         if sm.dev[SD_TIER2].block_count > 0 {
             return Err(unsupported("writing to Fusion containers"));
         }
-        if sm.ip_bm_size_in_blocks != 1 {
-            return Err(unsupported("internal-pool bitmaps larger than one block"));
+        if sm.ip_bm_size_in_blocks == 0 || sm.ip_block_count > sm.ip_bm_size_in_blocks as u64 * bs * 8 {
+            return Err(corrupt("the internal-pool bitmap is too small for the internal pool"));
         }
         let mut cibs = Vec::new();
         for paddr in sm.dev_addrs(SD_MAIN)? {
@@ -75,11 +78,19 @@ impl Space {
             }
             cibs.push(Cib { paddr, raw, dirty: false });
         }
-        let ip_index = sm.ip_bitmap_indices()?[0];
-        let ip_bitmap = c.raw_block(sm.ip_bm_base + ip_index as u64)?;
+        // The bitmap's blocks each sit somewhere in a ring of blocks.
+        let mut ip_bitmap = Vec::with_capacity(sm.ip_bm_size_in_blocks as usize * bs as usize);
+        for index in sm.ip_bitmap_indices()? {
+            if index as u32 >= sm.ip_bm_block_count {
+                return Err(corrupt(format!("internal-pool bitmap index {index} outside its ring")));
+            }
+            ip_bitmap.extend(c.raw_block(sm.ip_bm_base + index as u64)?);
+        }
+        let ip_dirty = vec![false; sm.ip_bm_size_in_blocks as usize];
 
         let mut fq: [Vec<FqEntry>; 2] = [Vec::new(), Vec::new()];
         let mut fq_roots = [None, None];
+        let fq_old_nodes = std::cell::RefCell::new(Vec::new());
         for (slot, q) in [SFQ_IP, SFQ_MAIN].into_iter().enumerate() {
             let tree_oid = sm.fq[q].tree_oid;
             if tree_oid == 0 {
@@ -91,7 +102,12 @@ impl Space {
             let root = c.node(root_paddr)?;
             let info = root.info()?;
             fq_roots[slot] = Some((root.hdr.obj_type, info));
-            let resolve = |oid: u64| c.ephemeral_paddr(oid).ok_or_else(|| corrupt(format!("free queue node {oid:#x} missing")));
+            // Non-root nodes: the tree is rebuilt as one node at commit, so
+            // their checkpoint entries go.
+            let resolve = |oid: u64| {
+                fq_old_nodes.borrow_mut().push(oid);
+                c.ephemeral_paddr(oid).ok_or_else(|| corrupt(format!("free queue node {oid:#x} missing")))
+            };
             btree::scan_with_ghosts(&NodeReader(c), &root, &info, &resolve, &mut |k, v| {
                 fq[slot].push(FqEntry {
                     xid: u64_at(k, 0)?,
@@ -110,9 +126,10 @@ impl Space {
             bitmaps: HashMap::new(),
             dirty_chunks: BTreeSet::new(),
             ip_bitmap,
-            ip_dirty: false,
+            ip_dirty,
             fq,
             fq_roots,
+            fq_old_nodes: fq_old_nodes.into_inner(),
             run_hint: 0,
         })
     }
@@ -234,7 +251,7 @@ impl Space {
             .find(|&i| self.ip_bitmap[i / 8] >> (i % 8) & 1 == 0)
             .ok_or_else(|| Error::NoSpace("the space manager's internal pool is full".into()))?;
         self.ip_bitmap[i / 8] |= 1 << (i % 8);
-        self.ip_dirty = true;
+        self.ip_dirty[i / (self.bs as usize * 8)] = true;
         Ok(self.sm.ip_base + i as u64)
     }
 
@@ -252,7 +269,7 @@ impl Space {
             for b in e.paddr..e.paddr + e.count {
                 let i = (b - self.sm.ip_base) as usize;
                 self.ip_bitmap[i / 8] &= !(1 << (i % 8));
-                self.ip_dirty = true;
+                self.ip_dirty[i / (self.bs as usize * 8)] = true;
             }
         }
         let main_old: Vec<FqEntry> = self.fq[SFQ_MAIN].iter().filter(|e| e.xid < xid).copied().collect();
@@ -273,7 +290,7 @@ impl Space {
     /// Writes the changed bitmaps, CIBs and internal-pool bitmap (appending
     /// them to `writes`) and returns the new ephemeral objects: the space
     /// manager and the free-queue trees, as (oid, bytes).
-    pub fn finish(mut self, writes: &mut Vec<(u64, Vec<u8>)>) -> Result<Vec<(u64, Vec<u8>)>> {
+    pub fn finish(mut self, writes: &mut Vec<(u64, Vec<u8>)>) -> Result<(Vec<(u64, Vec<u8>)>, Vec<u64>)> {
         let xid = self.xid;
         for ch in std::mem::take(&mut self.dirty_chunks) {
             let new = self.ip_alloc()?;
@@ -302,8 +319,10 @@ impl Space {
             let off = self.sm.dev[SD_MAIN].addr_offset as usize + i * 8;
             put_u64(&mut self.sm_raw, off, new);
         }
-        if self.ip_dirty {
-            self.rotate_ip_bitmap(writes)?;
+        for j in 0..self.ip_dirty.len() {
+            if self.ip_dirty[j] {
+                self.rotate_ip_bitmap(writes, j)?;
+            }
         }
 
         // Fixed fields of the space manager.
@@ -348,18 +367,19 @@ impl Space {
             }
             out.push((self.sm.fq[q].tree_oid, build(&nb, self.bs as usize)?));
         }
-        Ok(out)
+        Ok((out, std::mem::take(&mut self.fq_old_nodes)))
     }
 
     /// Writes the internal-pool bitmap to the next free block of its ring and
     /// returns the previous one to the end of the ring's free list.
-    fn rotate_ip_bitmap(&mut self, writes: &mut Vec<(u64, Vec<u8>)>) -> Result<()> {
+    fn rotate_ip_bitmap(&mut self, writes: &mut Vec<(u64, Vec<u8>)>, j: usize) -> Result<()> {
         let sm = &self.sm;
         let (head_off, tail_off) = (320usize, 322usize);
         let next_off = sm.ip_bm_free_next_offset as usize;
+        let index_off = sm.ip_bitmap_offset as usize + j * 2;
         let get16 = |raw: &[u8], off: usize| u16::from_le_bytes([raw[off], raw[off + 1]]);
         let set16 = |raw: &mut [u8], off: usize, v: u16| raw[off..off + 2].copy_from_slice(&v.to_le_bytes());
-        let old = get16(&self.sm_raw, sm.ip_bitmap_offset as usize);
+        let old = get16(&self.sm_raw, index_off);
         let new = get16(&self.sm_raw, head_off);
         if new == NO_INDEX {
             return Err(unsupported("the internal-pool bitmap ring has no free block"));
@@ -378,9 +398,10 @@ impl Space {
         }
         set16(&mut self.sm_raw, tail_off, old);
 
-        set16(&mut self.sm_raw, sm.ip_bitmap_offset as usize, new);
-        put_u64(&mut self.sm_raw, sm.ip_bm_xid_offset as usize, self.xid);
-        writes.push((sm.ip_bm_base + new as u64, self.ip_bitmap.clone()));
+        set16(&mut self.sm_raw, index_off, new);
+        put_u64(&mut self.sm_raw, sm.ip_bm_xid_offset as usize + j * 8, self.xid);
+        let bs = self.bs as usize;
+        writes.push((sm.ip_bm_base + new as u64, self.ip_bitmap[j * bs..(j + 1) * bs].to_vec()));
         Ok(())
     }
 }
