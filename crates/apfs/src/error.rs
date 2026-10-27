@@ -12,6 +12,8 @@ pub enum Error {
     Exists(String),
     /// A name that APFS cannot store.
     InvalidName(String),
+    /// A folder that still has entries.
+    NotEmpty(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -25,6 +27,7 @@ impl fmt::Display for Error {
             Error::NotFound(m) => write!(f, "not found: {m}"),
             Error::Exists(m) => write!(f, "already exists: {m}"),
             Error::InvalidName(m) => write!(f, "invalid name: {m}"),
+            Error::NotEmpty(m) => write!(f, "folder not empty: {m}"),
         }
     }
 }

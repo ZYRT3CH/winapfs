@@ -8,7 +8,7 @@ use crate::name_hash::name_len_and_hash;
 const OBJ_ID_MASK: u64 = 0x0fff_ffff_ffff_ffff;
 const APFS_TYPE_EXTENT: u64 = 2;
 const APFS_TYPE_INODE: u64 = 3;
-const APFS_TYPE_XATTR: u64 = 4;
+pub const APFS_TYPE_XATTR: u64 = 4;
 const APFS_TYPE_DSTREAM_ID: u64 = 6;
 const APFS_TYPE_FILE_EXTENT: u64 = 8;
 const APFS_TYPE_DIR_REC: u64 = 9;
@@ -22,6 +22,7 @@ pub const INO_EXT_TYPE_NAME: u8 = 4;
 pub const INO_EXT_TYPE_DSTREAM: u8 = 8;
 pub const INO_EXT_TYPE_SPARSE_BYTES: u8 = 13;
 pub const XF_DO_NOT_COPY: u8 = 0x02;
+pub const XF_CHILDREN_INHERIT: u8 = 0x08;
 pub const XF_SYSTEM_FIELD: u8 = 0x20;
 pub const UF_COMPRESSED: u32 = 0x20;
 const S_IFMT: u16 = 0o170000;
@@ -45,6 +46,16 @@ fn hdr(id: u64, kind: u64) -> [u8; 8] {
 /// The object id in a key's header.
 pub fn key_id(key: &[u8]) -> u64 {
     u64::from_le_bytes(key[0..8].try_into().unwrap()) & OBJ_ID_MASK
+}
+
+/// The record type in a key's header.
+pub fn key_type(key: &[u8]) -> u64 {
+    u64::from_le_bytes(key[0..8].try_into().unwrap()) >> 60
+}
+
+/// A search bound below every record of object `id`.
+pub fn key_bound(id: u64) -> Vec<u8> {
+    hdr(id, 0).to_vec()
 }
 
 pub fn inode_key(id: u64) -> Vec<u8> {

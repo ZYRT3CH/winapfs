@@ -22,7 +22,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use apfs::check::{check_volume, CheckOptions};
-use apfs::write::NewKind;
+use apfs::write::{NewKind, Session};
 use apfs::{format_uuid, gpt, Container, FileDevice, FileKind, Inode, Volume};
 
 const USAGE: &str = r"winapfs - read Mac (APFS) drives on Windows.
@@ -307,35 +307,29 @@ fn run(a: &Args) -> CliResult {
         "dev-touch" | "dev-mkdir" => {
             need(2)?;
             let kind = if a.cmd == "dev-mkdir" { NewKind::Folder } else { NewKind::File };
-            let mut w = apfs::write::Writer::open(Path::new(&a.pos[0]))?;
+            let mut s = Session::open(Path::new(&a.pos[0]), a.vol)?;
             for path in &a.pos[1..] {
-                let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
-                let dir_id = w.container().volume(a.vol)?.lookup_path(dir)?.id;
-                let (id, xid) = w.create(a.vol, dir_id, name, kind)?;
-                println!("created {path:?} as inode {id} in xid {xid}");
+                let (dir, name) = split_path(&s, path)?;
+                let id = s.create(dir, name, kind)?;
+                println!("created {path:?} as inode {id} in xid {}", s.container().xid());
             }
             Ok(())
         }
         // dev-put <image> <local file> <path in image>: creates or replaces a file.
         "dev-put" => {
             need(3)?;
-            let src = File::open(&a.pos[1])?;
+            let mut src = File::open(&a.pos[1])?;
             let len = src.metadata()?.len();
             let dest = a.pos[2].trim_end_matches('/');
-            let mut w = apfs::write::Writer::open(Path::new(&a.pos[0]))?;
-            let existing = w.container().volume(a.vol)?.lookup_path(dest).ok().map(|i| i.id);
-            let id = match existing {
-                Some(id) => id,
-                None => {
-                    let (dir, name) = dest.rsplit_once('/').unwrap_or(("", dest));
-                    let dir_id = w.container().volume(a.vol)?.lookup_path(dir)?.id;
-                    w.create(a.vol, dir_id, name, NewKind::File)?.0
-                }
-            };
+            let mut s = Session::open(Path::new(&a.pos[0]), a.vol)?;
             let start = Instant::now();
-            let xid = w.write_file(a.vol, id, &mut io::BufReader::new(src), len)?;
+            let id = dev_put(&mut s, &mut src, dest)?;
             let secs = start.elapsed().as_secs_f64().max(1e-6);
-            println!("wrote {len} bytes to {dest:?} (inode {id}) in xid {xid}, {:.1} MB/s", len as f64 / secs / 1e6);
+            println!(
+                "wrote {len} bytes to {dest:?} (inode {id}) in xid {}, {:.1} MB/s",
+                s.container().xid(),
+                len as f64 / secs / 1e6
+            );
             Ok(())
         }
         // dev-fill <image> <count> [folder] [per-transaction]: makes files f000001...
@@ -344,19 +338,84 @@ fn run(a: &Args) -> CliResult {
             let count: u32 = a.pos[1].parse().map_err(|_| CliError::new("count must be a number"))?;
             let dir = a.pos.get(2).map_or("", String::as_str);
             let batch: u32 = a.pos.get(3).and_then(|s| s.parse().ok()).unwrap_or(1).max(1);
-            let mut w = apfs::write::Writer::open(Path::new(&a.pos[0]))?;
-            let dir_id = w.container().volume(a.vol)?.lookup_path(dir)?.id;
+            let mut s = Session::open(Path::new(&a.pos[0]), a.vol)?;
+            let dir_id = s.volume()?.lookup_path(dir)?.id;
             let mut done = 0;
             while done < count {
                 let n = batch.min(count - done);
                 let names: Vec<String> = (done..done + n).map(|i| format!("f{:06}", i + 1)).collect();
                 let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-                let (_, xid) = w.create_many(a.vol, dir_id, &refs, NewKind::File)?;
+                s.create_many(dir_id, &refs, NewKind::File)?;
                 done += n;
                 if done % 500 == 0 || done == count {
-                    println!("{done} files, xid {xid}");
+                    println!("{done} files, xid {}", s.container().xid());
                 }
             }
+            Ok(())
+        }
+        "dev-rm" => {
+            need(2)?;
+            let mut s = Session::open(Path::new(&a.pos[0]), a.vol)?;
+            for path in &a.pos[1..] {
+                let (dir, name) = split_path(&s, path)?;
+                s.remove(dir, name)?;
+                println!("removed {path:?} in xid {}", s.container().xid());
+            }
+            Ok(())
+        }
+        // dev-mv <image> <from> <to> [replace]
+        "dev-mv" => {
+            need(3)?;
+            let mut s = Session::open(Path::new(&a.pos[0]), a.vol)?;
+            let (sdir, sname) = split_path(&s, &a.pos[1])?;
+            let (ddir, dname) = split_path(&s, &a.pos[2])?;
+            s.rename(sdir, sname, ddir, dname, a.pos.get(3).is_some_and(|x| x == "replace"))?;
+            println!("moved {:?} to {:?} in xid {}", a.pos[1], a.pos[2], s.container().xid());
+            Ok(())
+        }
+        // dev-script <image> <script>: runs write operations, one per line:
+        //   write <path> <offset> <local file> | size <path> <bytes> | flush
+        //   mkdir <path> | touch <path> | rm <path> | mv <from> <to> [replace]
+        "dev-script" => {
+            need(2)?;
+            let mut s = Session::open(Path::new(&a.pos[0]), a.vol)?;
+            for (n, line) in fs::read_to_string(&a.pos[1])?.lines().enumerate() {
+                let w: Vec<&str> = line.split_whitespace().collect();
+                let fail = |e: apfs::Error| CliError::new(format!("line {}: {line}: {e}", n + 1));
+                let id_of = |s: &Session, p: &str| s.volume().and_then(|v| v.lookup_path(p)).map(|i| i.id);
+                match w.as_slice() {
+                    [] => {}
+                    [c, ..] if c.starts_with('#') => {}
+                    ["flush"] => s.flush().map_err(fail)?,
+                    ["mkdir", p] | ["touch", p] => {
+                        let kind = if w[0] == "mkdir" { NewKind::Folder } else { NewKind::File };
+                        let (dir, name) = split_path(&s, p)?;
+                        s.create(dir, name, kind).map_err(fail)?;
+                    }
+                    ["rm", p] => {
+                        let (dir, name) = split_path(&s, p)?;
+                        s.remove(dir, name).map_err(fail)?;
+                    }
+                    ["mv", from, to, rest @ ..] => {
+                        let (sdir, sname) = split_path(&s, from)?;
+                        let (ddir, dname) = split_path(&s, to)?;
+                        s.rename(sdir, sname, ddir, dname, rest == ["replace"]).map_err(fail)?;
+                    }
+                    ["write", p, off, local] => {
+                        let id = id_of(&s, p).map_err(fail)?;
+                        let off: u64 = off.parse().map_err(|_| CliError::new(format!("line {}: bad offset", n + 1)))?;
+                        s.write(id, off, &fs::read(local)?).map_err(fail)?;
+                    }
+                    ["size", p, size] => {
+                        let id = id_of(&s, p).map_err(fail)?;
+                        let size: u64 = size.parse().map_err(|_| CliError::new(format!("line {}: bad size", n + 1)))?;
+                        s.set_size(id, size).map_err(fail)?;
+                    }
+                    _ => return Err(CliError::new(format!("line {}: cannot parse {line:?}", n + 1))),
+                }
+            }
+            s.flush()?;
+            println!("script done, xid {}", s.container().xid());
             Ok(())
         }
         "dev-rename" => {
@@ -367,6 +426,38 @@ fn run(a: &Args) -> CliResult {
         }
         other => Err(CliError::new(format!("unknown command `{other}`")).hint(USAGE)),
     }
+}
+
+/// Splits a path in an image into its folder's inode number and the last name.
+fn split_path<'p>(s: &Session, path: &'p str) -> Result<(u64, &'p str), CliError> {
+    let path = path.trim_end_matches('/');
+    let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+    Ok((s.volume()?.lookup_path(dir)?.id, name))
+}
+
+/// Creates (or truncates) the file at `dest` and copies `src` into it.
+fn dev_put(s: &mut Session, src: &mut File, dest: &str) -> Result<u64, CliError> {
+    let existing = s.volume()?.lookup_path(dest).ok().map(|i| i.id);
+    let id = match existing {
+        Some(id) => id,
+        None => {
+            let (dir, name) = split_path(s, dest)?;
+            s.create(dir, name, NewKind::File)?
+        }
+    };
+    s.set_size(id, 0)?;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut off = 0;
+    loop {
+        let n = io::Read::read(src, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        s.write(id, off, &buf[..n])?;
+        off += n as u64;
+    }
+    s.flush()?;
+    Ok(id)
 }
 
 /// `disk3`, `disk:3` and `PhysicalDrive3` all mean `\\.\PhysicalDrive3`.

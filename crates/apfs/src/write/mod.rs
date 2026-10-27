@@ -11,24 +11,23 @@
 mod fs;
 mod space;
 mod tree;
+mod vol;
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::Path;
-use std::sync::Arc;
 
-use crate::btree::Node;
-use crate::btree_write::Entry;
-use crate::bytes::{u32_at, u64_at};
+use crate::bytes::u64_at;
 use crate::checksum;
 use crate::dev::{FileDevice, ImageFile, WriteDevice};
 use crate::error::{corrupt, unsupported, Error, Result};
-use crate::fs::Volume;
+use crate::fs::{Inode, Volume};
 use crate::gpt;
 use crate::nx::{CheckpointMapping, Container};
 use crate::obj::{OBJ_PHYSICAL, OBJECT_TYPE_CHECKPOINT_MAP};
 use space::Space;
-use tree::{omap_cmp, omap_drop, omap_put, PhysReader, Reader, Tree};
+use tree::{omap_cmp, omap_drop, omap_put, PhysReader, Tree};
+use vol::{VolEdit, VolState};
+pub use vol::{NewKind, Times};
 
 const CHECKPOINT_MAP_LAST: u32 = 0x1;
 /// `NX_RESERVED_2`: "remove it when modifying the container".
@@ -76,13 +75,6 @@ pub struct Txn {
     nx_omap_oid: Option<u64>,
     /// `nx_next_oid`: ids for new virtual objects, such as tree nodes.
     next_oid: u64,
-}
-
-/// What [`Writer::create`] makes.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum NewKind {
-    File,
-    Folder,
 }
 
 /// Byte offset of the APFS container in an image: its GPT partition, or 0.
@@ -153,44 +145,15 @@ impl Writer {
         self.commit(t)
     }
 
-    /// Creates an empty file or folder `name` in folder `dir_id` of volume
-    /// `vol`; returns the new inode number and the transaction id.
-    pub fn create(&mut self, vol: usize, dir_id: u64, name: &str, kind: NewKind) -> Result<(u64, u64)> {
-        let (ids, xid) = self.create_many(vol, dir_id, &[name], kind)?;
-        Ok((ids[0], xid))
-    }
-
-    /// Creates several entries in one folder in a single transaction.
-    pub fn create_many(&mut self, vol: usize, dir_id: u64, names: &[&str], kind: NewKind) -> Result<(Vec<u64>, u64)> {
-        let mut t = self.begin()?;
-        let now = now_ns();
-        let v = self.c.volume(vol)?;
-        let mut e = VolEdit::open(&v)?;
-        let ids = names.iter().map(|name| e.create(dir_id, name, kind, now)).collect::<Result<Vec<_>>>()?;
-        self.finish_volume(&mut t, e)?;
-        drop(v);
-        Ok((ids, self.commit(t)?))
-    }
-
-    /// Replaces the contents of file `id` with `len` bytes read from `src`;
-    /// returns the transaction id.
-    pub fn write_file(&mut self, vol: usize, id: u64, src: &mut dyn Read, len: u64) -> Result<u64> {
-        let mut t = self.begin()?;
-        let v = self.c.volume(vol)?;
-        let mut e = VolEdit::open(&v)?;
-        e.set_data(&mut t, &self.dev, id, src, len, now_ns())?;
-        self.finish_volume(&mut t, e)?;
-        drop(v);
-        self.commit(t)
-    }
-
-    /// Writes a volume's changes: its file-system and extent-reference trees,
-    /// its object map and a new copy of its superblock.
-    fn finish_volume(&self, t: &mut Txn, e: VolEdit) -> Result<()> {
+    /// Writes a volume's changes: the records of files being written, its
+    /// file-system and extent-reference trees, its object map and a new copy
+    /// of its superblock.
+    fn finish_volume(&self, t: &mut Txn, v: &Volume, mut st: VolState) -> Result<()> {
         if t.nx_omap_oid.is_some() {
             return Err(unsupported("changing two volumes in one transaction"));
         }
-        let VolEdit { v, tree, extref, mut apsb, data_alloced, data_freed } = e;
+        VolEdit { v, st: &mut st }.flush_files()?;
+        let VolState { tree, extref, mut apsb, data_alloced, data_freed, .. } = st;
         let (mut alloced, mut freed) = (data_alloced, data_freed);
         if tree.changed() {
             let f = tree.flush(&self.c, &mut t.space, &mut t.writes, t.xid, &mut t.next_oid)?;
@@ -365,219 +328,145 @@ impl Writer {
     }
 }
 
-/// Reads a volume's file-system tree nodes through its object map.
-struct VolReader<'a, 'c>(&'a Volume<'c>);
-
-impl Reader for VolReader<'_, '_> {
-    fn read(&self, oid: u64) -> Result<(Arc<Node>, u64)> {
-        self.0.fs_node(oid)
-    }
+/// One volume open for changes, as a mounted file system uses it: changes
+/// to names and folders commit at once; file data collects in an open
+/// transaction until [`Session::flush`] (or the next change that commits).
+pub struct Session {
+    w: Writer,
+    vol: usize,
+    open: Option<(Txn, VolState)>,
 }
 
-/// A volume being changed in a transaction: its file-system tree and (once
-/// needed) its extent-reference tree, edited copy-on-write, and a copy of
-/// its superblock.
-struct VolEdit<'a, 'c> {
-    v: &'a Volume<'c>,
-    tree: Tree,
-    extref: Option<Tree>,
-    apsb: Vec<u8>,
-    /// File data blocks allocated and freed.
-    data_alloced: u64,
-    data_freed: u64,
-}
-
-/// Longest extent this writes, in blocks (128 MiB with 4 KiB blocks).
-const MAX_EXTENT_BLOCKS: u64 = 32768;
-/// Blocks copied per device write.
-const COPY_BLOCKS: u64 = 256;
-
-impl<'a, 'c> VolEdit<'a, 'c> {
-    fn open(v: &'a Volume<'c>) -> Result<Self> {
-        if v.sb.num_snapshots > 0 {
-            return Err(unsupported("writing to volumes that have snapshots"));
-        }
-        let tree = Tree::open(&VolReader(v), v.sb.root_tree_oid, fs::key_cmp)?;
-        Ok(Self { v, tree, extref: None, apsb: v.sb.raw.clone(), data_alloced: 0, data_freed: 0 })
+impl Session {
+    pub fn open(path: &Path, vol: usize) -> Result<Self> {
+        let w = Writer::open(path)?;
+        w.c.volume(vol)?;
+        Ok(Self { w, vol, open: None })
     }
 
-    fn extref(&mut self) -> Result<&mut Tree> {
-        if self.extref.is_none() {
-            let rd = PhysReader(self.v.container());
-            self.extref = Some(Tree::open(&rd, self.v.sb.extentref_tree_oid, fs::key_cmp)?);
-        }
-        Ok(self.extref.as_mut().unwrap())
+    /// The committed state, as a reader sees it. Files being written read
+    /// through [`Session::read_pending`] instead.
+    pub fn volume(&self) -> Result<Volume<'_>> {
+        self.w.c.volume(self.vol)
     }
 
-    fn remove(&mut self, key: &[u8]) -> Result<bool> {
-        self.tree.remove(&VolReader(self.v), key)
+    pub fn container(&self) -> &Container {
+        &self.w.c
     }
 
-    /// Replaces a file's data with `len` bytes from `src`, written straight
-    /// to newly allocated blocks (free in every checkpoint that can still be
-    /// mounted, so writing them early is safe).
-    fn set_data(&mut self, t: &mut Txn, dev: &ImageFile, id: u64, src: &mut dyn Read, len: u64, now: u64) -> Result<()> {
-        let c = self.v.container();
-        let bs = c.block_size() as u64;
-        let key = fs::inode_key(id);
-        let inode = self.get(&key)?.ok_or_else(|| Error::NotFound(format!("inode {id}")))?;
-        if !fs::is_regular(&inode) {
-            return Err(unsupported("writing data to something other than a regular file"));
-        }
-        let (mut fixed, mut fields) = fs::split_inode(&inode)?;
-        if u32_at(&fixed, 68)? & fs::UF_COMPRESSED != 0 {
-            return Err(unsupported("rewriting compressed files"));
-        }
-        let stream = u64_at(&fixed, 8)?; // private_id
-        let old = fields.iter().find(|f| f.0 == fs::INO_EXT_TYPE_DSTREAM).map(|f| f.2.clone());
-        self.drop_data(t, stream)?;
-
-        let mut logical = 0;
-        let mut buf = Vec::new();
-        while logical < len {
-            let want = (len - logical).div_ceil(bs).min(MAX_EXTENT_BLOCKS);
-            let (start, n) = t.space.alloc_run(c, want)?;
-            if start == 0 || start + n > c.sb.block_count {
-                return Err(corrupt(format!("allocator returned blocks outside the container: {start:#x}+{n}")));
-            }
-            let mut done = 0;
-            while done < n {
-                let k = (n - done).min(COPY_BLOCKS);
-                let bytes = (len - logical - done * bs).min(k * bs) as usize;
-                buf.clear();
-                buf.resize((k * bs) as usize, 0);
-                src.read_exact(&mut buf[..bytes])?;
-                dev.write_at((start + done) * bs, &buf)?;
-                done += k;
-            }
-            self.put(fs::file_extent_key(stream, logical), fs::file_extent_val(n * bs, start))?;
-            self.extref()?.upsert(&PhysReader(c), fs::phys_ext_key(start), Some(fs::phys_ext_val(n, stream, 1)))?;
-            self.data_alloced += n;
-            logical += n * bs;
-        }
-
-        if old.is_some() || len > 0 {
-            if self.get(&fs::dstream_id_key(stream))?.is_none() {
-                self.put(fs::dstream_id_key(stream), fs::dstream_id_val(1))?;
-            }
-            let (written, read) = match &old {
-                Some(d) => (u64_at(d, 24)?, u64_at(d, 32)?),
-                None => (0, 0),
-            };
-            let dstream = fs::dstream(len, logical, written + len, read);
-            fs::set_xfield(&mut fields, fs::INO_EXT_TYPE_DSTREAM, fs::XF_SYSTEM_FIELD, dstream);
-        }
-        fields.retain(|f| f.0 != fs::INO_EXT_TYPE_SPARSE_BYTES);
-        let flags = u64_at(&fixed, 48)? & !fs::INODE_IS_SPARSE;
-        put_u64(&mut fixed, 48, flags);
-        put_u64(&mut fixed, 24, now); // mod_time
-        put_u64(&mut fixed, 32, now); // change_time
-        self.put(key, fs::join_inode(&fixed, &fields))
+    /// Whether changes are waiting for [`Session::flush`].
+    pub fn dirty(&self) -> bool {
+        self.open.as_ref().is_some_and(|(_, st)| st.changed())
     }
 
-    /// Removes a data stream's extents, releasing their blocks.
-    fn drop_data(&mut self, t: &mut Txn, stream: u64) -> Result<()> {
-        let bs = self.v.container().block_size() as u64;
-        let (lo, hi) = fs::file_extent_range(stream);
-        for (k, v) in self.range(&lo, &hi)? {
-            self.remove(&k)?;
-            let v = v.ok_or_else(|| corrupt("file extent without a value"))?;
-            let (len, phys) = (u64_at(&v, 0)? & fs::FILE_EXTENT_LEN_MASK, u64_at(&v, 8)?);
-            if phys != 0 {
-                // (Block 0 marks a hole in a sparse file.)
-                self.release_extent(t, phys, len.div_ceil(bs))?;
+    /// The size of file `id` if it is being written.
+    pub fn pending_size(&self, id: u64) -> Option<u64> {
+        self.open.as_ref().and_then(|(_, st)| st.pending_size(id))
+    }
+
+    /// Reads file `id` if it is being written; `None` otherwise.
+    pub fn read_pending(&mut self, id: u64, off: u64, buf: &mut [u8]) -> Result<Option<usize>> {
+        if self.pending_size(id).is_none() {
+            return Ok(None);
+        }
+        let v = self.w.c.volume(self.vol)?;
+        let (_, st) = self.open.as_mut().unwrap();
+        VolEdit { v: &v, st }.read_pending(id, off, buf)
+    }
+
+    /// Runs `f` on the open transaction, starting one if needed. A failure
+    /// that may have left changes half made discards the transaction.
+    fn edit<R>(&mut self, f: impl FnOnce(&mut VolEdit, &mut Txn, &dyn WriteDevice) -> Result<R>) -> Result<R> {
+        if self.open.is_none() {
+            let t = self.w.begin()?;
+            let st = VolState::open(&self.w.c.volume(self.vol)?)?;
+            self.open = Some((t, st));
+        }
+        let v = self.w.c.volume(self.vol)?;
+        let (t, st) = self.open.as_mut().unwrap();
+        let r = f(&mut VolEdit { v: &v, st }, t, &self.w.dev);
+        drop(v);
+        if let Err(e) = &r {
+            // These are found before anything changes.
+            if !matches!(e, Error::NotFound(_) | Error::Exists(_) | Error::InvalidName(_) | Error::NotEmpty(_)) {
+                self.open = None;
             }
         }
+        r
+    }
+
+    /// Commits the open transaction, if there is one with changes.
+    pub fn flush(&mut self) -> Result<()> {
+        let Some((mut t, st)) = self.open.take() else { return Ok(()) };
+        if !st.changed() {
+            return Ok(());
+        }
+        let v = self.w.c.volume(self.vol)?;
+        self.w.finish_volume(&mut t, &v, st)?;
+        drop(v);
+        self.w.commit(t)?;
         Ok(())
     }
 
-    /// Frees `blocks` blocks from `phys` and takes them out of the
-    /// extent-reference tree, splitting a record that covers more.
-    fn release_extent(&mut self, t: &mut Txn, phys: u64, blocks: u64) -> Result<()> {
-        let rd = PhysReader(self.v.container());
-        let x = self.extref()?;
-        let (k, v) = x
-            .floor(&rd, &fs::phys_ext_key(phys))?
-            .ok_or_else(|| corrupt(format!("no extent reference for block {phys:#x}")))?;
-        let v = v.ok_or_else(|| corrupt("extent reference without a value"))?;
-        let start = fs::key_id(&k);
-        let (rlen, owner, refcnt) = (u64_at(&v, 0)? & fs::PEXT_LEN_MASK, u64_at(&v, 8)?, u32_at(&v, 16)? as i32);
-        if start + rlen < phys + blocks {
-            return Err(corrupt(format!("blocks {phys:#x}+{blocks} are not covered by an extent reference")));
-        }
-        if refcnt != 1 {
-            return Err(unsupported("rewriting data shared with clones or snapshots"));
-        }
-        x.remove(&rd, &k)?;
-        if start < phys {
-            x.upsert(&rd, fs::phys_ext_key(start), Some(fs::phys_ext_val(phys - start, owner, 1)))?;
-        }
-        if phys + blocks < start + rlen {
-            let rest = start + rlen - phys - blocks;
-            x.upsert(&rd, fs::phys_ext_key(phys + blocks), Some(fs::phys_ext_val(rest, owner, 1)))?;
-        }
-        t.space.free_run(phys, blocks);
-        self.data_freed += blocks;
-        Ok(())
+    fn edit_and_flush<R>(&mut self, f: impl FnOnce(&mut VolEdit, &mut Txn, &dyn WriteDevice) -> Result<R>) -> Result<R> {
+        let r = self.edit(f)?;
+        self.flush()?;
+        Ok(r)
     }
 
-    fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(self.tree.get(&VolReader(self.v), key)?.flatten())
+    /// Creates an empty file or folder; returns its inode number.
+    pub fn create(&mut self, dir: u64, name: &str, kind: NewKind) -> Result<u64> {
+        let now = now_ns();
+        self.edit_and_flush(|e, _, _| e.create(dir, name, kind, now))
     }
 
-    fn put(&mut self, key: Vec<u8>, val: Vec<u8>) -> Result<()> {
-        self.tree.upsert(&VolReader(self.v), key, Some(val))
+    /// Creates several entries in one transaction.
+    pub fn create_many(&mut self, dir: u64, names: &[&str], kind: NewKind) -> Result<Vec<u64>> {
+        let now = now_ns();
+        self.edit_and_flush(|e, _, _| names.iter().map(|n| e.create(dir, n, kind, now)).collect())
     }
 
-    fn range(&mut self, lo: &[u8], hi: &[u8]) -> Result<Vec<Entry>> {
-        self.tree.range(&VolReader(self.v), lo, hi)
+    /// Deletes a file or an empty folder.
+    pub fn remove(&mut self, dir: u64, name: &str) -> Result<()> {
+        let now = now_ns();
+        self.edit_and_flush(|e, t, _| e.unlink(t, dir, name, now))
     }
 
-    /// Adds `delta` to a superblock counter.
-    fn bump(&mut self, off: usize, delta: i64) -> Result<()> {
-        let v = u64_at(&self.apsb, off)?.wrapping_add_signed(delta);
-        put_u64(&mut self.apsb, off, v);
-        Ok(())
+    /// Moves or renames an entry; see [`VolEdit::rename`].
+    pub fn rename(&mut self, sdir: u64, sname: &str, ddir: u64, dname: &str, replace: bool) -> Result<()> {
+        let now = now_ns();
+        self.edit_and_flush(|e, t, _| e.rename(t, sdir, sname, ddir, dname, replace, now))
     }
 
-    /// A new inode number (`apfs_next_obj_id`).
-    fn take_id(&mut self) -> Result<u64> {
-        let id = u64_at(&self.apsb, 176)?;
-        put_u64(&mut self.apsb, 176, id + 1);
-        Ok(id)
+    pub fn set_times(&mut self, id: u64, times: Times) -> Result<()> {
+        self.edit_and_flush(|e, _, _| e.set_times(id, times))
     }
 
-    fn create(&mut self, dir_id: u64, name: &str, kind: NewKind, now: u64) -> Result<u64> {
-        if name.is_empty() || name.len() > 255 || name.contains(['/', '\0']) || name == "." || name == ".." {
-            return Err(Error::InvalidName(format!("{name:?}")));
+    pub fn set_hidden(&mut self, id: u64, hidden: bool) -> Result<()> {
+        self.edit_and_flush(|e, _, _| e.set_hidden(id, hidden))
+    }
+
+    /// Writes into file `id` (kept in the open transaction).
+    pub fn write(&mut self, id: u64, off: u64, data: &[u8]) -> Result<()> {
+        self.edit(|e, t, dev| e.write(t, dev, id, off, data))
+    }
+
+    /// Changes the size of file `id` (kept in the open transaction).
+    pub fn set_size(&mut self, id: u64, size: u64) -> Result<()> {
+        self.edit(|e, t, dev| e.set_size(t, dev, id, size))
+    }
+
+    /// The inode as it stands, including changes not yet committed.
+    pub fn inode(&mut self, id: u64) -> Result<Inode> {
+        if self.open.is_none() {
+            return self.volume()?.inode(id);
         }
-        let ci = self.v.sb.is_case_insensitive();
-        let parent_key = fs::inode_key(dir_id);
-        let mut parent = self.get(&parent_key)?.ok_or_else(|| Error::NotFound(format!("folder {dir_id}")))?;
-        if !fs::is_dir(&parent) {
-            return Err(Error::NotFound(format!("folder {dir_id} (it is a file)")));
+        let mut inode = self.edit(|e, _, _| e.inode(id))?;
+        if let Some(size) = self.pending_size(id) {
+            let alloced_size = inode.dstream.map_or(0, |d| d.alloced_size);
+            inode.dstream = Some(crate::fs::Dstream { size, alloced_size });
         }
-        let (lo, hi) = fs::drec_hash_range(dir_id, name, ci);
-        let want = self.v.name_key(name);
-        if self.range(&lo, &hi)?.iter().any(|(k, _)| self.v.name_key(&fs::drec_name(k)) == want) {
-            return Err(Error::Exists(format!("{name:?}")));
-        }
-
-        let id = self.take_id()?;
-        let (mode, dt, counter) = match kind {
-            NewKind::File => (fs::S_IFREG, fs::DT_REG, 184),  // apfs_num_files
-            NewKind::Folder => (fs::S_IFDIR, fs::DT_DIR, 192), // apfs_num_directories
-        };
-        // The folder: one more child, and its times move.
-        let children = i32::from_le_bytes(parent[56..60].try_into().unwrap());
-        parent[56..60].copy_from_slice(&(children + 1).to_le_bytes());
-        put_u64(&mut parent, 24, now); // mod_time
-        put_u64(&mut parent, 32, now); // change_time
-        self.put(parent_key, parent)?;
-        self.put(fs::inode_key(id), fs::new_inode(dir_id, id, name, now, mode))?;
-        self.put(fs::drec_key(dir_id, name, ci), fs::drec_val(id, now, dt))?;
-        self.bump(counter, 1)?;
-        Ok(id)
+        Ok(inode)
     }
 }
 
