@@ -203,7 +203,7 @@ pub fn setup(remove: bool) -> CliResult {
     }
 
     println!("installed {}  (on the system PATH; open a new terminal to use `winapfs`)", exe.display());
-    println!("registered with the WinFsp launcher; it runs winapfs as SYSTEM, read-only");
+    println!("registered with the WinFsp launcher; it runs winapfs as SYSTEM (read-only unless write mode is on)");
     println!("auto-mount service: {}", if automount_running() { "running, starts with Windows" } else { "installed but NOT running" });
     println!("allowed   to mount and unmount: your account ({sid}), Administrators, SYSTEM");
     println!("limits    the service mounts only whole disks (diskN) at drive letters");
@@ -488,15 +488,51 @@ pub fn write_command(arg: Option<&str>) -> CliResult {
             } else if write_mode() {
                 std::fs::remove_file(write_switch()).map_err(|e| CliError::new(format!("could not turn write mode off: {e}")))?;
             }
-            remount_all(if a == "on" { MountMode::Write } else { MountMode::ReadOnly });
+            if automount_running() {
+                wait_for_mode(a == "on");
+            } else {
+                remount_all(if a == "on" { MountMode::Write } else { MountMode::ReadOnly });
+            }
             Ok(())
         }
         Some(other) => Err(CliError::new(format!("`winapfs write {other}`: say on or off"))),
     }
 }
 
+/// The auto-mount service remounts its drives when write mode changes;
+/// waits until they show up in the new mode.
+fn wait_for_mode(write: bool) {
+    let Ok(l) = Launcher::load() else { return };
+    let mismatched = || -> Vec<String> {
+        l.running()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(c, _)| c == CLASS)
+            .map(|(_, i)| i)
+            .filter(|i| l.info(CLASS, i).is_ok_and(|info| info.iter().any(|s| s.contains("mode=write")) != write))
+            .collect()
+    };
+    if mismatched().is_empty() {
+        return;
+    }
+    println!("mounting your Mac drive again{}...", if write { ", writable (it is checked first; about half a minute)" } else { ", read-only" });
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_secs(240) {
+        std::thread::sleep(Duration::from_secs(1));
+        let shown: Vec<String> =
+            l.running().unwrap_or_default().into_iter().filter(|(c, _)| c == CLASS).map(|(_, i)| i).collect();
+        if mismatched().is_empty() && shown.iter().all(|i| Path::new(&format!("{i}:\\")).exists()) {
+            for i in shown {
+                println!("{i}: is back, {}", if write { "writable" } else { "read-only" });
+            }
+            return;
+        }
+    }
+    println!("still working on it; the drive shows up when ready (details in {})", install_dir().join("automount.log").display());
+}
+
 /// Mounts the Mac drives shown now again in `mode`, so a change of write
-/// mode applies at once.
+/// mode applies at once (when the auto-mount service is not running).
 fn remount_all(mode: MountMode) {
     let Ok(l) = Launcher::load() else { return };
     let running: Vec<String> =
@@ -509,10 +545,10 @@ fn remount_all(mode: MountMode) {
         };
         println!("remounting {inst}: ({disk})");
         let _ = l.stop(CLASS, &inst);
-        let root = format!("{inst}:\\");
+        // Until the old instance is gone: a writable mount checks the drive as it stops.
         let t = Instant::now();
-        while Path::new(&root).exists() && t.elapsed() < Duration::from_secs(15) {
-            std::thread::sleep(Duration::from_millis(200));
+        while running_here(&l, &inst) && t.elapsed() < Duration::from_secs(180) {
+            std::thread::sleep(Duration::from_millis(250));
         }
         if let Err(e) = mount(&disk, &format!("{inst}:"), 0, None, mode) {
             println!("could not remount {inst}: {}", e.msg);

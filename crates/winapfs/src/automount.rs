@@ -57,6 +57,32 @@ fn poll(l: &Launcher, st: &mut State, log: &mut dyn FnMut(&str)) {
         })
         .collect();
 
+    // Write mode was switched: mount drives again in the new mode. (Done
+    // here, so the restart is not mistaken for someone unmounting a drive.)
+    let want_write = crate::service::write_mode();
+    for (d, letter) in &served {
+        let is_write = l.info(CLASS, letter).is_ok_and(|info| info.iter().any(|s| s.contains("mode=write")));
+        // Only drives this service mounted: a mount someone started by hand keeps its mode.
+        if is_write == want_write || !present.contains(d) || !st.ours.contains_key(d) {
+            continue;
+        }
+        log(&format!("write mode is {}; mounting {letter}: (disk{d}) again", if want_write { "on" } else { "off" }));
+        let _ = l.stop(CLASS, letter);
+        // A writable mount checks the drive once more as it stops.
+        let t = std::time::Instant::now();
+        while l.running().unwrap_or_default().iter().any(|(c, i)| c == CLASS && i == letter) && t.elapsed() < Duration::from_secs(180) {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let mut args = vec![format!("src=disk{d}"), format!("at={letter}:"), "vol=0".to_string()];
+        if want_write {
+            args.push("mode=write".to_string());
+        }
+        if let Err(e) = l.start(CLASS, letter, &args) {
+            log(&format!("could not mount disk{d} again: {e}"));
+        }
+        return; // look again at the next poll
+    }
+
     st.declined.retain(|d| present.contains(d));
     // A mount that went away while its disk is still plugged in was unmounted
     // on purpose (or failed to start): don't fight it.

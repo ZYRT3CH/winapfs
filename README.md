@@ -18,7 +18,7 @@
 <p align="center">
   No Mac needed. No paid tools. No reformatting.<br>
   <a href="#-set-it-up-in-2-minutes"><b>Set it up</b></a> ·
-  <a href="#%EF%B8%8F-writing-to-your-mac-drive-beta"><b>Writing (beta)</b></a> ·
+  <a href="#-writing-to-your-mac-drive-beta"><b>Writing (beta)</b></a> ·
   <a href="#-questions"><b>Questions</b></a> ·
   <a href="docs/HOW-IT-WORKS.md"><b>How it works</b></a>
 </p>
@@ -32,7 +32,7 @@
       Drives formatted on a Mac (APFS) show up in File Explorer with a drive letter. Photos, videos, projects: open them, play them, copy them.
     </td>
     <td width="33%" valign="top">
-      <h3>✍️ Writes, too <sup>beta</sup></h3>
+      <h3>📝 Writes, too <sup>beta</sup></h3>
       Copy files onto the drive, make folders, rename, move and delete, straight from Explorer or any program. Take it back to your Mac and keep going.
     </td>
     <td width="33%" valign="top">
@@ -82,7 +82,7 @@ That's it. From now on this happens by itself.
 
 ---
 
-## ✍️ Writing to your Mac drive (beta)
+## 📝 Writing to your Mac drive (beta)
 
 Out of the box your Mac drive opens **read-only**, so nothing can change by accident. To save files onto it too, turn on write mode once. Open **Terminal** from the Start menu and run:
 
@@ -132,7 +132,7 @@ Open **Terminal** and run `winapfs uninstall`, then click **Yes** when Windows a
 ## ❓ Questions
 
 **Can I save files onto the Mac drive?**
-Yes, with write mode (beta). See [Writing to your Mac drive](#%EF%B8%8F-writing-to-your-mac-drive-beta).
+Yes, with write mode (beta). See [Writing to your Mac drive](#-writing-to-your-mac-drive-beta).
 
 **Is it safe for my Mac drive?**
 In the default read-only mode, nothing can change at all: Windows itself blocks every write. With write mode on, winapfs follows APFS's copy-on-write rules and checks the drive before writing (see above). As with any new software that writes to disks: keep backups.
@@ -157,7 +157,7 @@ Run `winapfs disks` in a terminal. It lists connected disks that have a Mac part
 
 ---
 
-## ⌨️ For the command line
+## 💻 For the command line
 
 ```
 winapfs disks                          list connected Mac disks
