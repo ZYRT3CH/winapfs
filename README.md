@@ -17,6 +17,12 @@
 
 <p align="center">No Mac needed. No paid tools. No reformatting.</p>
 
+<p align="center">
+  <a href="https://github.com/ZYRT3CH/winapfs/releases/latest"><img src="https://img.shields.io/badge/new%20in%20v0.1.2-up%20to%202.7x%20faster-f472b6?style=for-the-badge" alt="New in v0.1.2: up to 2.7x faster"></a><br>
+  <b>🚀 Up to 2.7x faster in write mode.</b> A Samsung T7 over USB 3 now reads <b>829 MB/s</b> and writes <b>782 MB/s</b>,<br>
+  and every Mac drive you write to gets the same boost, up to what the drive and USB port allow. <a href="https://github.com/ZYRT3CH/winapfs/releases/latest">What changed</a>
+</p>
+
 <h3 align="center">⚡ Set up in about 10 seconds</h3>
 <p align="center">Paste this into <b>PowerShell</b> or <b>Terminal</b>, then plug in your Mac drive:</p>
 
@@ -55,8 +61,8 @@ irm https://raw.githubusercontent.com/ZYRT3CH/winapfs/main/install.ps1 | iex
       APFS never overwrites data in place, and winapfs keeps it that way. It checks the whole drive before writing and refuses if anything looks off.
     </td>
     <td width="33%" valign="top">
-      <h3>⚡ Quick</h3>
-      Changes are saved in batches, so copying hundreds of small files feels like a normal drive. Speed is set by your USB port.
+      <h3>⚡ Fast <sup>new</sup></h3>
+      829 MB/s reads and 782 MB/s writes on a Samsung T7 over USB 3. Saving never pauses your copy, big files are written in the background, and reads keep several requests going at once.
     </td>
     <td width="33%" valign="top">
       <h3>💜 Free and open</h3>
@@ -215,7 +221,7 @@ Encrypted drives are not supported yet.
 Macs allow a few characters in names that Windows does not, such as `:` or `?`. winapfs shows these as similar-looking symbols so you can still open the files.
 
 **How fast is it?**
-As fast as your USB connection and drive allow. On a USB 2 port that is roughly 35 MB/s. A blue USB 3 port is many times faster. Slower than you expected? See [Drive slow?](#-drive-slow-find-out-why)
+Since v0.1.2, with write mode on, a Samsung T7 over USB 3 (10 Gbps) reads big files at about 829 MB/s, writes them at 782 MB/s and copies 200+ small files a second. Other Mac drives get the same improvements; your drive and USB port set the limit. On a USB 2 port that is only about 35-40 MB/s, so if your drive feels slow, plug it into a blue USB 3 port or a USB-C port on the back of the PC, with the cable that came with the drive. Not sure why it is slow? See [Drive slow? Find out why](#-drive-slow-find-out-why).
 
 **The drive did not appear.**
 Run `winapfs disks` in a terminal. It lists connected disks that have a Mac partition. If your drive is listed but no drive letter appears, run `winapfs mount auto M:` to see the error message, and [open an issue](https://github.com/ZYRT3CH/winapfs/issues).
