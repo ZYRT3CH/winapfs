@@ -316,6 +316,31 @@ impl Space {
         self.fq[SFQ_MAIN].push(FqEntry { xid: self.xid, paddr, count });
     }
 
+    /// Free main-device blocks, after this transaction's allocations.
+    pub fn free_blocks(&self) -> u64 {
+        self.sm.dev[SD_MAIN].free_count
+    }
+
+    /// Frees queued so far.
+    pub fn queued_frees(&self) -> usize {
+        self.fq.iter().map(Vec::len).sum()
+    }
+
+    /// Where a transaction should stop queueing frees and commit: half of
+    /// what fits under the free queues' node limits (and well inside one
+    /// checkpoint-map block), leaving room for the frees the commit adds.
+    pub fn queued_free_limit(&self) -> usize {
+        // A leaf entry: a 16-byte key, an 8-byte count, a 4-byte table slot.
+        let per_leaf = (self.bs as usize - 56) / 28;
+        let leaves = [SFQ_IP, SFQ_MAIN]
+            .iter()
+            .map(|&q| self.sm.fq[q].tree_node_limit as usize)
+            .filter(|&l| l > 1)
+            .fold(61, usize::min)
+            - 1;
+        leaves * per_leaf / 2
+    }
+
     fn ip_alloc(&mut self) -> Result<u64> {
         let n = self.sm.ip_block_count as usize;
         let i = (0..n)

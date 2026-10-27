@@ -1,6 +1,7 @@
 //! Data sources for the WinFsp mount: an APFS volume, and a fixed in-memory
 //! tree for testing the Windows side without a Mac drive.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -67,7 +68,38 @@ pub struct ApfsRwBackend {
     decompressed: Mutex<Option<(u64, u64, Arc<Vec<u8>>)>>,
     /// When the last change came in, and when the oldest uncommitted one did.
     activity: Mutex<(Instant, Option<Instant>)>,
+    /// Changes Windows had been told were made could not be saved. From then
+    /// on every change is refused, so programs see errors (and a move stops
+    /// before deleting more originals) instead of losing more.
+    failed: AtomicBool,
+    /// Committed data read ahead; Windows does not cache writable mounts.
+    window: Mutex<ReadWindow>,
+    /// Counts changes: a window read before the latest one is not used.
+    generation: AtomicU64,
+    /// Free bytes as of a transaction: (xid, bytes).
+    free: Mutex<(u64, u64)>,
 }
+
+/// Free bytes in the committed state, with the transaction they are from.
+fn free_space(s: &Session, total: u64, block_size: u64) -> (u64, u64) {
+    let used: u64 = s.container().volume_superblocks().map_or(0, |v| v.iter().map(|v| v.alloc_blocks).sum());
+    (s.container().xid(), total.saturating_sub(used * block_size))
+}
+
+#[derive(Default)]
+struct ReadWindow {
+    id: u64,
+    generation: u64,
+    start: u64,
+    data: Vec<u8>,
+    next_fetch: usize,
+}
+
+/// Smallest and largest read-ahead: reads arrive in small pieces, and on a
+/// USB link every one costs a round trip, so sequential readers get ever
+/// larger fetches.
+const READ_AHEAD_MIN: usize = 256 * 1024;
+const READ_AHEAD_MAX: usize = 8 * 1024 * 1024;
 
 /// Changes are committed once the volume has been quiet this long...
 const COMMIT_AFTER_QUIET: Duration = Duration::from_millis(1000);
@@ -86,7 +118,9 @@ impl ApfsRwBackend {
             (v.sb.name.clone(), v.name_rule(), u32::from_le_bytes(v.sb.vol_uuid[..4].try_into().unwrap()), v.sb.last_mod_time);
         drop(v);
         let total = s.container().sb.block_count * block_size;
+        let free = free_space(&s, total, block_size);
         Ok(Self {
+            free: Mutex::new(free),
             s: Mutex::new(s),
             label,
             rule,
@@ -96,11 +130,68 @@ impl ApfsRwBackend {
             total,
             decompressed: Mutex::new(None),
             activity: Mutex::new((Instant::now(), None)),
+            failed: AtomicBool::new(false),
+            window: Mutex::new(ReadWindow::default()),
+            generation: AtomicU64::new(0),
         })
     }
 
     pub fn session(&self) -> std::sync::MutexGuard<'_, Session> {
         self.s.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Runs a change on the session, unless changes were lost before; a
+    /// loss this one causes stops all further changes.
+    fn change<R>(&self, s: &mut Session, f: impl FnOnce(&mut Session) -> apfs::Result<R>) -> Result<R, NTSTATUS> {
+        if self.failed.load(Ordering::SeqCst) {
+            return Err(STATUS_MEDIA_WRITE_PROTECTED);
+        }
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        let r = f(s);
+        self.check_lost(s);
+        let r = r.map_err(status)?;
+        self.changed();
+        Ok(r)
+    }
+
+    fn check_lost(&self, s: &mut Session) {
+        if let Some(why) = s.take_lost() {
+            self.failed.store(true, Ordering::SeqCst);
+            crate::trace::log(&format!(
+                "winapfs: changes from the last few seconds could not be saved ({why}). \
+                 The drive now refuses changes to keep the rest safe: unmount it, plug it back in, \
+                 and check the files you copied most recently."
+            ));
+        }
+    }
+
+    /// Reads committed data through a window that grows while reads stay
+    /// sequential. Runs under the session lock, so no change slips in.
+    fn read_ahead(&self, v: &Volume, inode: &Inode, off: u64, buf: &mut [u8]) -> Result<usize, NTSTATUS> {
+        let size = v.file_size(inode).map_err(status)?;
+        if off >= size {
+            return Ok(0);
+        }
+        let want = (buf.len() as u64).min(size - off) as usize;
+        let generation = self.generation.load(Ordering::SeqCst);
+        let mut w = self.window.lock().unwrap();
+        let same = w.id == inode.id && w.generation == generation;
+        let end = w.start + w.data.len() as u64;
+        if same && off >= w.start && off + want as u64 <= end {
+            let s = (off - w.start) as usize;
+            buf[..want].copy_from_slice(&w.data[s..s + want]);
+            return Ok(want);
+        }
+        let sequential = same && off >= w.start && off <= end;
+        let next_fetch = if sequential { (w.next_fetch * 2).clamp(READ_AHEAD_MIN, READ_AHEAD_MAX) } else { READ_AHEAD_MIN };
+        let fetch = (next_fetch.max(want) as u64).min(size - off) as usize;
+        let mut data = vec![0u8; fetch];
+        let n = v.read_at(inode, off, &mut data).map_err(status)?;
+        data.truncate(n);
+        let k = want.min(n);
+        buf[..k].copy_from_slice(&data[..k]);
+        *w = ReadWindow { id: inode.id, generation, start: off, data, next_fetch };
+        Ok(k)
     }
 
     /// Records a change: the committer waits for a quiet moment.
@@ -131,11 +222,17 @@ impl Backend for ApfsRwBackend {
         self.label.clone()
     }
 
+    /// Explorer asks for this constantly while copying: answer from the last
+    /// count unless a commit has changed it, and never wait behind a commit.
     fn total_and_free(&self) -> (u64, u64) {
         let _t = Timer("volume info".to_string(), Instant::now());
-        let s = self.session();
-        let used: u64 = s.container().volume_superblocks().map_or(0, |v| v.iter().map(|v| v.alloc_blocks).sum());
-        (self.total, self.total.saturating_sub(used * self.block_size))
+        let mut free = self.free.lock().unwrap();
+        if let Ok(s) = self.s.try_lock() {
+            if s.container().xid() != free.0 {
+                *free = free_space(&s, self.total, self.block_size);
+            }
+        }
+        (self.total, free.1)
     }
 
     fn case_insensitive(&self) -> bool {
@@ -190,7 +287,7 @@ impl Backend for ApfsRwBackend {
         let v = s.volume().map_err(status)?;
         let inode = v.inode(id).map_err(status)?;
         if !inode.is_compressed() {
-            return v.read_at(&inode, off, buf).map_err(status);
+            return self.read_ahead(&v, &inode, off, buf);
         }
         let mut cache = self.decompressed.lock().unwrap();
         let data = match &*cache {
@@ -226,8 +323,7 @@ impl Backend for ApfsRwBackend {
     fn create(&self, dir: u64, name: &str, is_dir: bool) -> Result<Meta, NTSTATUS> {
         let _t = Timer(format!("create {name:?} in {dir}"), Instant::now());
         let kind = if is_dir { NewKind::Folder } else { NewKind::File };
-        let id = self.session().create(dir, name, kind).map_err(status)?;
-        self.changed();
+        let id = self.change(&mut self.session(), |s| s.create(dir, name, kind))?;
         self.stat(id)
     }
 
@@ -235,44 +331,36 @@ impl Backend for ApfsRwBackend {
         let start = Instant::now();
         let mut s = self.session();
         let _t = Timer(format!("write {} bytes at {off} of {id}", data.len()), start);
-        s.write(id, off, data).map_err(status)?;
-        self.changed();
+        self.change(&mut s, |s| s.write(id, off, data))?;
         Ok(s.pending_size(id).unwrap_or(off + data.len() as u64))
     }
 
     fn set_size(&self, id: u64, size: u64) -> Result<(), NTSTATUS> {
         let _t = Timer(format!("set size of {id} to {size}"), Instant::now());
-        self.session().set_size(id, size).map_err(status)?;
-        self.changed();
-        Ok(())
+        self.change(&mut self.session(), |s| s.set_size(id, size))
     }
 
     fn remove(&self, dir: u64, name: &str) -> Result<(), NTSTATUS> {
         let _t = Timer(format!("remove {name:?} from {dir}"), Instant::now());
-        self.session().remove(dir, name).map_err(status)?;
-        self.changed();
-        Ok(())
+        self.change(&mut self.session(), |s| s.remove(dir, name))
     }
 
     fn rename(&self, sdir: u64, sname: &str, ddir: u64, dname: &str, replace: bool) -> Result<(), NTSTATUS> {
         let _t = Timer(format!("rename {sname:?}"), Instant::now());
-        self.session().rename(sdir, sname, ddir, dname, replace).map_err(status)?;
-        self.changed();
-        Ok(())
+        self.change(&mut self.session(), |s| s.rename(sdir, sname, ddir, dname, replace))
     }
 
     fn set_info(&self, id: u64, t: SetTimes, hidden: Option<bool>) -> Result<(), NTSTATUS> {
         let _t = Timer(format!("set info of {id}"), Instant::now());
-        let mut s = self.session();
-        if t.create.is_some() || t.access.is_some() || t.write.is_some() || t.change.is_some() {
-            let times = Times { create: t.create, modify: t.write, change: t.change, access: t.access };
-            s.set_times(id, times).map_err(status)?;
-        }
-        if let Some(h) = hidden {
-            s.set_hidden(id, h).map_err(status)?;
-        }
-        self.changed();
-        Ok(())
+        self.change(&mut self.session(), |s| {
+            if t.create.is_some() || t.access.is_some() || t.write.is_some() || t.change.is_some() {
+                s.set_times(id, Times { create: t.create, modify: t.write, change: t.change, access: t.access })?;
+            }
+            if let Some(h) = hidden {
+                s.set_hidden(id, h)?;
+            }
+            Ok(())
+        })
     }
 
     /// Commits everything collected so far.
@@ -282,7 +370,9 @@ impl Backend for ApfsRwBackend {
         let _t = Timer("flush".to_string(), start);
         // Taken under the session lock, so changes made meanwhile wait for the next commit.
         self.activity.lock().unwrap().1 = None;
-        s.flush().map_err(status)
+        let r = s.flush();
+        self.check_lost(&mut s);
+        r.map_err(status)
     }
 
     /// A file written through this mount was closed: the committer saves it

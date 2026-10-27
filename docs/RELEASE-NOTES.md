@@ -1,5 +1,15 @@
 **Your Mac drive, on Windows. Read it. Write it.** Plug in a drive formatted on a Mac (APFS) and it shows up in File Explorer. It opens read-only; turn on write mode and you can save files onto it too (beta).
 
+### What's new in 0.1.1
+
+**Big copies in write mode no longer freeze.** A long copy or move onto a writable Mac drive could stop dead at 0 bytes/s, with Explorer unable to cancel. The cause was a deadlock deep inside Windows' file cache and WinFsp, not in your files: write throttling waited for Windows' background writer, which waited for a file lock the throttled thread held. Writable drives now bypass the Windows cache, so every write goes straight to winapfs, and winapfs reads ahead itself to keep reading fast. With this fix, a 322 GB move onto a Samsung T7 over USB 3 ran at 350-500 MB/s on large files. **If a copy is frozen right now:** update, then restart Windows to clear it. Your Mac drive keeps everything saved before the freeze.
+
+**Saved files are never lost silently.** Changes are saved in batches every few seconds. Before, if saving a batch failed, the whole batch quietly disappeared while Explorer carried on, and in a move it had already deleted the originals. Now the drive stops taking changes and says why, so programs see an error and a move stops before deleting more originals.
+
+**A full drive fails only the file that doesn't fit.** A copy that runs out of space is refused before it changes anything (winapfs keeps 16 MiB free for its own bookkeeping), so the files copied just before it stay put and the drive stays writable.
+
+**Smoother copies of many small files.** Explorer asks for the free space constantly while copying; that answer is now remembered instead of read from the drive each time, and each save does one disk flush fewer.
+
 ### How to install
 
 **One command:** open Terminal or PowerShell and paste:
@@ -8,7 +18,7 @@
 irm https://raw.githubusercontent.com/ZYRT3CH/winapfs/main/install.ps1 | iex
 ```
 
-It downloads `winapfs.exe` from this release, checks its checksum and sets everything up.
+It downloads `winapfs.exe` from this release, checks its checksum and sets everything up. Already have winapfs? The same command updates it. Updating briefly unmounts your Mac drives, so let any copy finish first; they come back by themselves.
 
 **Or by hand:**
 

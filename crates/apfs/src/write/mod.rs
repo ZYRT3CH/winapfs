@@ -32,6 +32,9 @@ use vol::{VolEdit, VolState};
 pub use vol::{NewKind, Times};
 
 const CHECKPOINT_MAP_LAST: u32 = 0x1;
+/// Free space that writes and creates leave for the metadata their commit
+/// writes (new tree nodes, the space manager's blocks).
+const METADATA_RESERVE: u64 = 16 << 20;
 /// `NX_RESERVED_2`: "remove it when modifying the container".
 const NX_RESERVED_2: u64 = 0x2;
 /// Shown in a volume's `apfs_modified_by` history.
@@ -387,7 +390,10 @@ impl Writer {
         seal(&mut nsb);
 
         // Ordering is what makes this crash-safe: the new superblock is
-        // written only after everything it points to is durable.
+        // written only after everything it points to is durable. Its two
+        // copies (checkpoint area, then block 0) can share one flush: each
+        // points only at durable data, and readers take the newest checkpoint
+        // from the checkpoint area whatever block 0 says.
         let t_write = Instant::now();
         let mut all: Vec<(u64, Vec<u8>)> = writes.into_iter().chain(eph_writes).collect();
         all.sort_by_key(|w| w.0);
@@ -414,7 +420,6 @@ impl Writer {
         self.dev.flush()?;
         let flush1 = t_flush.elapsed();
         self.dev.write_at((desc_base + sb_pos) * bs, &nsb)?;
-        self.dev.flush()?;
         self.dev.write_at(0, &nsb)?;
         self.dev.flush()?;
         let t_reload = Instant::now();
@@ -448,27 +453,38 @@ pub struct Session {
     open: Option<(Txn, VolState)>,
     /// Keep every change in one transaction until an explicit flush.
     batch: bool,
+    /// Why changes that had already been accepted were thrown away, until
+    /// [`Session::take_lost`] reports it.
+    lost: Option<String>,
 }
 
 impl Session {
     pub fn open(path: &Path, vol: usize) -> Result<Self> {
         let w = Writer::open(path)?;
         w.c.volume(vol)?;
-        Ok(Self { w, vol, open: None, batch: false })
+        Ok(Self { w, vol, open: None, batch: false, lost: None })
     }
 
     /// A session on a real disk; see [`Writer::open_real_disk`].
     pub fn open_real_disk(path: &Path, base: u64, expected_uuid: [u8; 16], vol: usize) -> Result<Self> {
         let w = Writer::open_real_disk(path, base, expected_uuid)?;
         w.c.volume(vol)?;
-        Ok(Self { w, vol, open: None, batch: false })
+        Ok(Self { w, vol, open: None, batch: false, lost: None })
     }
 
     /// A session on a real disk whose writes stay in the returned overlay.
     pub fn rehearsal(base: FileDevice, vol: usize) -> Result<(Self, Arc<Overlay>)> {
         let (w, ov) = Writer::rehearsal(base)?;
         w.c.volume(vol)?;
-        Ok((Self { w, vol, open: None, batch: false }, ov))
+        Ok((Self { w, vol, open: None, batch: false, lost: None }, ov))
+    }
+
+    /// Why changes that earlier calls had accepted were thrown away (a
+    /// failed commit, or a failure that left a later change half made), if
+    /// that happened since the last call. The volume is back at its last
+    /// commit, so whoever was told those changes succeeded must be told now.
+    pub fn take_lost(&mut self) -> Option<String> {
+        self.lost.take()
     }
 
     /// The committed state, as a reader sees it. Files being written read
@@ -501,33 +517,64 @@ impl Session {
         VolEdit { v: &v, st }.read_pending(id, off, buf)
     }
 
-    /// Runs `f` on the open transaction, starting one if needed. A failure
-    /// that may have left changes half made discards the transaction.
-    fn edit<R>(&mut self, f: impl FnOnce(&mut VolEdit, &mut Txn, &dyn WriteDevice) -> Result<R>) -> Result<R> {
+    fn begin_if_needed(&mut self) -> Result<()> {
         if self.open.is_none() {
             let t = self.w.begin()?;
             let st = VolState::open(&self.w.c.volume(self.vol)?)?;
             self.open = Some((t, st));
         }
+        Ok(())
+    }
+
+    /// Refuses a change that would need `bytes` of new data blocks when that
+    /// would eat into [`METADATA_RESERVE`]: refused here, before anything
+    /// changes, a full drive fails this one change instead of the batch.
+    fn ensure_space(&mut self, bytes: u64) -> Result<()> {
+        self.begin_if_needed()?;
+        let bs = self.w.c.block_size() as u64;
+        let (t, _) = self.open.as_ref().unwrap();
+        if t.space.free_blocks() < bytes.div_ceil(bs) + METADATA_RESERVE / bs {
+            return Err(Error::NoSpace("the drive is full".into()));
+        }
+        Ok(())
+    }
+
+    /// Runs `f` on the open transaction, starting one if needed. A failure
+    /// that may have left changes half made discards the transaction.
+    fn edit<R>(&mut self, f: impl FnOnce(&mut VolEdit, &mut Txn, &dyn WriteDevice) -> Result<R>) -> Result<R> {
+        self.begin_if_needed()?;
         let v = self.w.c.volume(self.vol)?;
         let (t, st) = self.open.as_mut().unwrap();
+        let had_changes = st.changed();
         let r = f(&mut VolEdit { v: &v, st }, t, &*self.w.dev);
         drop(v);
         if let Err(e) = &r {
             // These are found before anything changes.
             if !matches!(e, Error::NotFound(_) | Error::Exists(_) | Error::InvalidName(_) | Error::NotEmpty(_)) {
+                if had_changes {
+                    self.lost = Some(e.to_string());
+                }
                 self.open = None;
             }
         }
         r
     }
 
-    /// Commits the open transaction, if there is one with changes.
+    /// Commits the open transaction, if there is one with changes. On
+    /// failure the changes are gone; see [`Session::take_lost`].
     pub fn flush(&mut self) -> Result<()> {
-        let Some((mut t, st)) = self.open.take() else { return Ok(()) };
+        let Some((t, st)) = self.open.take() else { return Ok(()) };
         if !st.changed() {
             return Ok(());
         }
+        let r = self.commit_changes(t, st);
+        if let Err(e) = &r {
+            self.lost = Some(e.to_string());
+        }
+        r
+    }
+
+    fn commit_changes(&mut self, mut t: Txn, st: VolState) -> Result<()> {
         let v = self.w.c.volume(self.vol)?;
         self.w.finish_volume(&mut t, &v, st)?;
         drop(v);
@@ -535,9 +582,15 @@ impl Session {
         Ok(())
     }
 
+    /// Whether the open transaction has queued so many frees that its
+    /// checkpoint could outgrow the free queues; then it commits early.
+    fn batch_full(&self) -> bool {
+        self.open.as_ref().is_some_and(|(t, _)| t.space.queued_frees() > t.space.queued_free_limit())
+    }
+
     fn edit_and_flush<R>(&mut self, f: impl FnOnce(&mut VolEdit, &mut Txn, &dyn WriteDevice) -> Result<R>) -> Result<R> {
         let r = self.edit(f)?;
-        if !self.batch {
+        if !self.batch || self.batch_full() {
             self.flush()?;
         }
         Ok(r)
@@ -589,12 +642,14 @@ impl Session {
 
     /// Creates an empty file or folder; returns its inode number.
     pub fn create(&mut self, dir: u64, name: &str, kind: NewKind) -> Result<u64> {
+        self.ensure_space(0)?;
         let now = now_ns();
         self.edit_and_flush(|e, _, _| e.create(dir, name, kind, now))
     }
 
     /// Creates several entries in one transaction.
     pub fn create_many(&mut self, dir: u64, names: &[&str], kind: NewKind) -> Result<Vec<u64>> {
+        self.ensure_space(0)?;
         let now = now_ns();
         self.edit_and_flush(|e, _, _| names.iter().map(|n| e.create(dir, n, kind, now)).collect())
     }
@@ -621,12 +676,21 @@ impl Session {
 
     /// Writes into file `id` (kept in the open transaction).
     pub fn write(&mut self, id: u64, off: u64, data: &[u8]) -> Result<()> {
-        self.edit(|e, t, dev| e.write(t, dev, id, off, data))
+        self.ensure_space(data.len() as u64)?;
+        self.edit(|e, t, dev| e.write(t, dev, id, off, data))?;
+        if self.batch_full() {
+            self.flush()?;
+        }
+        Ok(())
     }
 
     /// Changes the size of file `id` (kept in the open transaction).
     pub fn set_size(&mut self, id: u64, size: u64) -> Result<()> {
-        self.edit(|e, t, dev| e.set_size(t, dev, id, size))
+        self.edit(|e, t, dev| e.set_size(t, dev, id, size))?;
+        if self.batch_full() {
+            self.flush()?;
+        }
+        Ok(())
     }
 
     /// The inode as it stands, including changes not yet committed.

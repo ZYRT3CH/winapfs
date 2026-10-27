@@ -87,6 +87,10 @@ pub const VP_POST_CLEANUP_WHEN_MODIFIED_ONLY: u32 = 1 << 10;
 pub const VP_FLUSH_AND_PURGE_ON_CLEANUP: u32 = 1 << 14;
 pub const VP_UM_FILE_CONTEXT_IS_USER_CONTEXT2: u32 = 1 << 16;
 
+// Bit positions in `VolumeParams::flags_v1`.
+pub const VP1_VOLUME_INFO_TIMEOUT_VALID: u32 = 1 << 0;
+pub const VP1_SECURITY_TIMEOUT_VALID: u32 = 1 << 2;
+
 /// `FSP_FSCTL_VOLUME_INFO`
 #[repr(C)]
 pub struct VolumeInfo {

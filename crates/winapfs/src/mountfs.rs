@@ -902,9 +902,21 @@ pub fn mount(backend: &'static dyn Backend, mount_point: &str) -> Result<Mounted
     params.max_component_length = 255;
     params.volume_creation_time = filetime(backend.created());
     params.volume_serial_number = backend.serial();
-    // Infinite: WinFsp only lets the Windows cache manager cache file data
-    // with an infinite timeout, and every change comes through this mount.
-    params.file_info_timeout = u32::MAX;
+    // Read-only: infinite, because WinFsp only lets the Windows cache manager
+    // cache file data with an infinite timeout. Writable: no data caching.
+    // Through the cache, a big copy can deadlock in the kernel: write
+    // throttling (CcCanIWrite) waits for the lazy writer, and the lazy writer
+    // waits for a WinFsp file lock, so a file stops mid-copy with nothing
+    // ever reaching this process. Uncached, every write comes straight here.
+    params.file_info_timeout = if writable { 1000 } else { u32::MAX };
+    if writable {
+        // Caches that stay safe without the data cache: free space for a few
+        // seconds (Explorer asks for it constantly while copying), and the
+        // security descriptor, which never changes.
+        params.flags_v1 = VP1_VOLUME_INFO_TIMEOUT_VALID | VP1_SECURITY_TIMEOUT_VALID;
+        params.volume_info_timeout = 3000;
+        params.security_timeout = u32::MAX;
+    }
     params.flags = VP_CASE_PRESERVED_NAMES | VP_UNICODE_ON_DISK | VP_PERSISTENT_ACLS | VP_UM_FILE_CONTEXT_IS_USER_CONTEXT2;
     if writable {
         // Cached data reaches us before the last handle's cleanup, so the
