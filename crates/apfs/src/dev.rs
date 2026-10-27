@@ -111,6 +111,19 @@ impl WriteDevice for ImageFile {
     }
 }
 
+static SIM_WRITE_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static SIM_FLUSH_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// For performance tests on image files, which sit on fast local disks: the
+/// milliseconds in environment variable `var` are added to every write or
+/// flush, to act like a slow USB drive. Never applied to real disks.
+fn sim_delay(cell: &std::sync::OnceLock<u64>, var: &str) {
+    let ms = *cell.get_or_init(|| std::env::var(var).ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+    if ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+}
+
 #[cfg(windows)]
 fn pwrite_all(file: &File, mut off: u64, mut buf: &[u8]) -> Result<()> {
     use std::os::windows::fs::FileExt;
@@ -137,12 +150,16 @@ fn pwrite_all(file: &File, off: u64, buf: &[u8]) -> Result<()> {
 pub struct DiskFile {
     file: File,
     base: u64,
+    /// An image file standing in for a disk: may act slow (see [`sim_delay`]).
+    image: bool,
 }
 
 impl DiskFile {
     pub(crate) fn open_rw(path: &Path, base: u64) -> Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
-        Ok(Self { file, base })
+        let s = path.as_os_str().to_string_lossy();
+        let image = !(s.starts_with(r"\\") || s.starts_with("//")) && std::fs::metadata(path)?.is_file();
+        Ok(Self { file, base, image })
     }
 }
 
@@ -154,10 +171,16 @@ impl BlockDevice for DiskFile {
 
 impl WriteDevice for DiskFile {
     fn write_at(&self, off: u64, buf: &[u8]) -> Result<()> {
+        if self.image {
+            sim_delay(&SIM_WRITE_MS, "WINAPFS_SIM_WRITE_MS");
+        }
         pwrite_all(&self.file, self.base + off, buf)
     }
 
     fn flush(&self) -> Result<()> {
+        if self.image {
+            sim_delay(&SIM_FLUSH_MS, "WINAPFS_SIM_FLUSH_MS");
+        }
         Ok(self.file.sync_all()?)
     }
 }

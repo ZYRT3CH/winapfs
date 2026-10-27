@@ -1,14 +1,30 @@
 **Your Mac drive, on Windows. Read it. Write it.** Plug in a drive formatted on a Mac (APFS) and it shows up in File Explorer. It opens read-only; turn on write mode and you can save files onto it too (beta).
 
-### What's new in 0.1.1
+### What's new in 0.1.2: a lot faster in write mode
 
-**Big copies in write mode no longer freeze.** A long copy or move onto a writable Mac drive could stop dead at 0 bytes/s, with Explorer unable to cancel. The cause was a deadlock deep inside Windows' file cache and WinFsp, not in your files: write throttling waited for Windows' background writer, which waited for a file lock the throttled thread held. Writable drives now bypass the Windows cache, so every write goes straight to winapfs, and winapfs reads ahead itself to keep reading fast. With this fix, a 322 GB move onto a Samsung T7 over USB 3 ran at 350-500 MB/s on large files. **If a copy is frozen right now:** update, then restart Windows to clear it. Your Mac drive keeps everything saved before the freeze.
+Measured on a Samsung T7 over USB 3 (10 Gbps), same drive, same port, same test, before and after:
 
-**Saved files are never lost silently.** Changes are saved in batches every few seconds. Before, if saving a batch failed, the whole batch quietly disappeared while Explorer carried on, and in a move it had already deleted the originals. Now the drive stops taking changes and says why, so programs see an error and a move stops before deleting more originals.
+| | 0.1.1 | 0.1.2 | |
+|---|---|---|---|
+| Reading big files | 305 MB/s | **829 MB/s** | 2.7x |
+| Writing big files | 445 MB/s | **782 MB/s** | 1.8x |
+| Copying small files | 132 files/s | **200+ files/s** | 1.5x |
 
-**A full drive fails only the file that doesn't fit.** A copy that runs out of space is refused before it changes anything (winapfs keeps 16 MiB free for its own bookkeeping), so the files copied just before it stay put and the drive stays writable.
+The drive itself tops out around 1,020 MB/s on that link, so big reads now get about 80% of everything the cable can carry.
 
-**Smoother copies of many small files.** Explorer asks for the free space constantly while copying; that answer is now remembered instead of read from the drive each time, and each save does one disk flush fewer.
+- **Saving no longer stops the drive.** winapfs saves changes in batches every few seconds. Before, everything waited while a batch was written, 2 to 4 seconds at a time on a USB drive. Now a batch is prepared in memory in milliseconds and written while new changes keep coming in.
+- **Big files are written in the background.** File data goes to the drive on two background writers, so Explorer can keep handing over data while earlier data is still being written.
+- **Reads keep several requests in flight.** USB SSDs read far faster with several requests outstanding, so winapfs now reads four pieces at once, and fetches the next part of a file while you are still reading the current one.
+
+Safety comes first in all of it: a batch's blocks are kept in memory until it is on the drive, blocks it freed are not reused until then, and saves land strictly in order, so a crash or a pulled cable at any moment still leaves the last saved state intact. Every change was tested by killing winapfs mid-save (every surviving file intact, byte for byte), by reading files while they are rewritten over and over (about 50 GB of block reuse, no wrong byte), and with an independent APFS checker.
+
+**Copying many small files is now limited by Windows, not winapfs.** On the test PC even WinFsp's own empty in-memory demo drive manages only about 220 small files a second, because Microsoft Defender scans and reads back every new file on drives like these. Excluding your Mac drive from real-time scanning (Windows Security, Virus & threat protection, Exclusions) speeds this up a lot, at the cost of those files not being scanned as they are written. That choice is yours.
+
+### Also new since 0.1.0 (in 0.1.1)
+
+- **Big copies in write mode no longer freeze** (a deadlock in Windows' file cache and WinFsp; writable drives now bypass that cache). If a copy is frozen right now: update, then restart Windows.
+- **Saved files are never lost silently:** if a batch ever cannot be saved, the drive stops taking changes and says why, so a move stops before deleting more originals.
+- **A full drive fails only the file that doesn't fit**, and the drive stays writable.
 
 ### How to install
 

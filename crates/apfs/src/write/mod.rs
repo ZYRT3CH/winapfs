@@ -9,6 +9,7 @@
 //! mid-transaction loses the transaction, not the container.
 
 mod fs;
+mod pipe;
 mod space;
 mod tree;
 mod vol;
@@ -26,6 +27,8 @@ use crate::fs::{Inode, Volume};
 use crate::gpt;
 use crate::nx::{CheckpointMapping, Container};
 use crate::obj::{OBJ_PHYSICAL, OBJECT_TYPE_CHECKPOINT_MAP};
+use pipe::Pipe;
+pub use pipe::Prepared;
 use space::Space;
 use tree::{omap_cmp, omap_drop, omap_put, PhysReader, Tree};
 use vol::{VolEdit, VolState};
@@ -35,6 +38,8 @@ const CHECKPOINT_MAP_LAST: u32 = 0x1;
 /// Free space that writes and creates leave for the metadata their commit
 /// writes (new tree nodes, the space manager's blocks).
 const METADATA_RESERVE: u64 = 16 << 20;
+/// Background threads (each with its own disk handle) writing file data.
+const DATA_WRITERS: usize = 2;
 /// `NX_RESERVED_2`: "remove it when modifying the container".
 const NX_RESERVED_2: u64 = 0x2;
 /// Shown in a volume's `apfs_modified_by` history.
@@ -94,7 +99,10 @@ type OpenReader = Box<dyn Fn() -> Result<Box<dyn BlockDevice>> + Send + Sync>;
 /// seen through an [`Overlay`] that keeps the writes in memory.
 pub struct Writer {
     c: Container,
-    dev: Box<dyn WriteDevice>,
+    /// Where file data goes: written in the background (see [`pipe::DataDev`]).
+    dev: Arc<dyn WriteDevice>,
+    /// Commits on their way to the disk; readers see through it.
+    pipe: Arc<Pipe>,
     reader: OpenReader,
 }
 
@@ -122,10 +130,9 @@ impl Writer {
     pub fn open(path: &Path) -> Result<Self> {
         let base = container_offset(path)?;
         let dev = ImageFile::open_rw(path)?.with_base(base)?;
+        let writers = (0..DATA_WRITERS).map(|_| Ok(Box::new(ImageFile::open_rw(path)?.with_base(base)?) as Box<dyn WriteDevice>)).collect::<Result<_>>()?;
         let path = path.to_path_buf();
-        let reader: OpenReader = Box::new(move || Ok(Box::new(FileDevice::open(&path)?.with_base(base)?)));
-        let c = Container::open(reader()?)?;
-        Ok(Self { c, dev: Box::new(dev), reader })
+        Self::new(Arc::new(dev), writers, Box::new(move || Ok(Box::new(FileDevice::open(&path)?.with_base(base)?))))
     }
 
     /// Opens the container on a real disk for writing, from byte `base` of
@@ -133,8 +140,8 @@ impl Writer {
     /// renumbered disk can never be written by mistake.
     pub fn open_real_disk(path: &Path, base: u64, expected_uuid: [u8; 16]) -> Result<Self> {
         let read_path = path.to_path_buf();
-        let reader: OpenReader = Box::new(move || Ok(Box::new(FileDevice::open(&read_path)?.with_base(base)?)));
-        let c = Container::open(reader()?)?;
+        let open: OpenReader = Box::new(move || Ok(Box::new(FileDevice::open(&read_path)?.with_base(base)?)));
+        let c = Container::open(open()?)?;
         if c.sb.uuid != expected_uuid {
             return Err(unsupported(format!(
                 "container {} is not the one named for writing ({})",
@@ -142,8 +149,9 @@ impl Writer {
                 crate::format_uuid(&expected_uuid)
             )));
         }
-        let dev = DiskFile::open_rw(path, base)?;
-        Ok(Self { c, dev: Box::new(dev), reader })
+        drop(c);
+        let writers = (0..DATA_WRITERS).map(|_| Ok(Box::new(DiskFile::open_rw(path, base)?) as Box<dyn WriteDevice>)).collect::<Result<_>>()?;
+        Self::new(Arc::new(DiskFile::open_rw(path, base)?), writers, open)
     }
 
     /// A writer for the container on `base` (a read-only device) whose
@@ -152,9 +160,22 @@ impl Writer {
         let bs = Container::open(Box::new(base.try_clone()?))?.block_size() as u64;
         let ov = Arc::new(Overlay::new(Box::new(base), bs));
         let shared = Arc::clone(&ov);
-        let reader: OpenReader = Box::new(move || Ok(Box::new(Shared(Arc::clone(&shared)))));
+        let writers = (0..DATA_WRITERS).map(|_| Box::new(Shared(Arc::clone(&ov))) as Box<dyn WriteDevice>).collect();
+        let w = Self::new(Arc::new(Shared(Arc::clone(&ov))), writers, Box::new(move || Ok(Box::new(Shared(Arc::clone(&shared))))))?;
+        Ok((w, ov))
+    }
+
+    /// A writer on `dev`, with `writers` (more handles on it) for file data
+    /// and readers that `open` opens; they see everything still on its way
+    /// to `dev` through the pipe.
+    fn new(dev: Arc<dyn WriteDevice>, writers: Vec<Box<dyn WriteDevice>>, open: OpenReader) -> Result<Self> {
+        let c = Container::open(open()?)?;
+        let pipe = Pipe::new(dev, writers, c.block_size() as u64, c.xid());
+        let p = Arc::clone(&pipe);
+        let reader: OpenReader = Box::new(move || Ok(p.reader(open()?)));
+        // From the start, so file data still in flight is seen too.
         let c = Container::open(reader()?)?;
-        Ok((Self { c, dev: Box::new(Shared(Arc::clone(&ov))), reader }, ov))
+        Ok(Self { c, dev: Arc::new(pipe::DataDev(Arc::clone(&pipe))), pipe, reader })
     }
 
     /// The committed state, as a reader sees it.
@@ -162,18 +183,27 @@ impl Writer {
         &self.c
     }
 
+    /// Another handle on the container's device, for reading in parallel.
+    /// It sees commits still on their way to the disk.
+    pub fn open_reader(&self) -> Result<Box<dyn BlockDevice>> {
+        (self.reader)()
+    }
+
     fn reload(&mut self) -> Result<()> {
         self.c = Container::open((self.reader)()?)?;
         Ok(())
     }
 
-    /// Starts a transaction. Blocks that earlier transactions freed become
-    /// reusable now.
+    /// Starts a transaction. Blocks that transactions already on the disk
+    /// freed become reusable now.
     pub fn begin(&self) -> Result<Txn> {
+        if self.pipe.is_broken() {
+            return Err(corrupt("an earlier change could not be saved"));
+        }
         let start = Instant::now();
         let xid = self.c.sb.next_xid;
         let mut space = Space::load(&self.c, xid)?;
-        space.release_queued(&self.c)?;
+        space.release_queued(&self.c, self.pipe.durable())?;
         if start.elapsed().as_secs_f64() > 0.5 || tracing() {
             log(&format!("winapfs: starting transaction {xid} took {:.2} s", start.elapsed().as_secs_f64()));
         }
@@ -289,6 +319,19 @@ impl Writer {
     /// Commits a transaction: writes its blocks, then a new checkpoint.
     /// Returns the transaction id.
     pub fn commit(&mut self, t: Txn) -> Result<u64> {
+        let p = self.prepare(t)?;
+        let xid = p.xid();
+        p.persist()?;
+        Ok(xid)
+    }
+
+    /// Builds a transaction's blocks and its new checkpoint in memory and
+    /// makes them the state this writer reads; [`Prepared::persist`] writes
+    /// them, possibly while the next transaction is already under way.
+    pub fn prepare(&mut self, t: Txn) -> Result<Prepared> {
+        if self.pipe.is_broken() {
+            return Err(corrupt("an earlier change could not be saved"));
+        }
         let t_start = Instant::now();
         let Txn { xid, space, mut writes, nx_omap_oid, next_oid } = t;
         let mut next_oid = next_oid;
@@ -390,14 +433,15 @@ impl Writer {
         seal(&mut nsb);
 
         // Ordering is what makes this crash-safe: the new superblock is
-        // written only after everything it points to is durable. Its two
-        // copies (checkpoint area, then block 0) can share one flush: each
-        // points only at durable data, and readers take the newest checkpoint
-        // from the checkpoint area whatever block 0 says.
-        let t_write = Instant::now();
+        // written only after everything it points to is durable (see
+        // [`Prepared::persist`]). Its two copies (checkpoint area, then block
+        // 0) can share one flush: each points only at durable data, and
+        // readers take the newest checkpoint from the checkpoint area
+        // whatever block 0 says.
         let mut all: Vec<(u64, Vec<u8>)> = writes.into_iter().chain(eph_writes).collect();
         all.sort_by_key(|w| w.0);
         // Neighbouring blocks go out as one write: each request is a round trip.
+        let mut runs = Vec::new();
         let mut i = 0;
         while i < all.len() {
             let start = all[i].0;
@@ -413,34 +457,25 @@ impl Writer {
                 buf.extend_from_slice(&all[i].1);
                 i += 1;
             }
-            self.dev.write_at(start * bs, &buf)?;
+            runs.push((start, buf));
         }
-        self.dev.write_at(cpm_paddr * bs, &cpm)?;
-        let t_flush = Instant::now();
-        self.dev.flush()?;
-        let flush1 = t_flush.elapsed();
-        self.dev.write_at((desc_base + sb_pos) * bs, &nsb)?;
-        self.dev.write_at(0, &nsb)?;
-        self.dev.flush()?;
-        let t_reload = Instant::now();
+        runs.push((cpm_paddr, cpm));
+        let superblock = (desc_base + sb_pos, nsb);
+        self.pipe.stage(xid, &runs);
+        self.pipe.stage(xid, &[(superblock.0, superblock.1.clone()), (0, superblock.1.clone())]);
+        // Dropping it unwritten (an error below) stops later commits.
+        let data_mark = self.pipe.data_mark();
+        let p = Prepared { pipe: Arc::clone(&self.pipe), xid, runs, superblock, data_mark, done: false };
 
         self.reload()?;
         if self.c.xid() != xid {
             return Err(corrupt(format!("after committing xid {xid} the newest checkpoint is {}", self.c.xid())));
         }
-        let total = t_start.elapsed();
-        if total.as_secs_f64() > 1.0 || tracing() {
-            log(&format!(
-                "winapfs: commit {xid} took {:.2} s ({bitmap_reads} bitmaps read): prepare {:.2}, write {:.2}, flushes {:.2} (first {:.2}), reload {:.2}",
-                total.as_secs_f64(),
-                (t_write - t_start).as_secs_f64(),
-                (t_flush - t_write).as_secs_f64(),
-                (t_reload - t_flush).as_secs_f64(),
-                flush1.as_secs_f64(),
-                t_reload.elapsed().as_secs_f64()
-            ));
+        let took = t_start.elapsed().as_secs_f64();
+        if took > 0.5 || tracing() {
+            log(&format!("winapfs: commit {xid} prepared in {took:.2} s ({bitmap_reads} bitmaps read)"));
         }
-        Ok(xid)
+        Ok(p)
     }
 }
 
@@ -495,6 +530,11 @@ impl Session {
 
     pub fn container(&self) -> &Container {
         &self.w.c
+    }
+
+    /// See [`Writer::open_reader`].
+    pub fn open_reader(&self) -> Result<Box<dyn BlockDevice>> {
+        self.w.open_reader()
     }
 
     /// Whether changes are waiting for [`Session::flush`].
@@ -560,26 +600,38 @@ impl Session {
         r
     }
 
-    /// Commits the open transaction, if there is one with changes. On
-    /// failure the changes are gone; see [`Session::take_lost`].
+    /// Commits the open transaction, if there is one with changes, and waits
+    /// until it is on the disk. On failure the changes are gone; see
+    /// [`Session::take_lost`].
     pub fn flush(&mut self) -> Result<()> {
-        let Some((t, st)) = self.open.take() else { return Ok(()) };
+        let Some(p) = self.prepare_flush()? else { return Ok(()) };
+        p.persist().map_err(|e| {
+            self.lost = Some(e.to_string());
+            e
+        })
+    }
+
+    /// Prepares the open transaction, if there is one with changes, for
+    /// [`Prepared::persist`], which needs nothing from this session: changes
+    /// made while it runs start the next transaction. On failure the changes
+    /// are gone; see [`Session::take_lost`].
+    pub fn prepare_flush(&mut self) -> Result<Option<Prepared>> {
+        let Some((t, st)) = self.open.take() else { return Ok(None) };
         if !st.changed() {
-            return Ok(());
+            return Ok(None);
         }
-        let r = self.commit_changes(t, st);
+        let r = self.prepare_changes(t, st);
         if let Err(e) = &r {
             self.lost = Some(e.to_string());
         }
-        r
+        r.map(Some)
     }
 
-    fn commit_changes(&mut self, mut t: Txn, st: VolState) -> Result<()> {
+    fn prepare_changes(&mut self, mut t: Txn, st: VolState) -> Result<Prepared> {
         let v = self.w.c.volume(self.vol)?;
         self.w.finish_volume(&mut t, &v, st)?;
         drop(v);
-        self.w.commit(t)?;
-        Ok(())
+        self.w.prepare(t)
     }
 
     /// Whether the open transaction has queued so many frees that its
@@ -780,7 +832,7 @@ pub fn check_writable(c: &Container) -> Vec<String> {
     }
     match Space::load(c, sb.next_xid) {
         Ok(mut s) => {
-            if let Err(e) = s.release_queued(c) {
+            if let Err(e) = s.release_queued(c, c.xid()) {
                 problems.push(format!("space manager, releasing freed blocks: {e}"));
             }
         }

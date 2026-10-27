@@ -357,10 +357,11 @@ impl Space {
 
     /// Releases blocks freed by earlier transactions: no checkpoint that
     /// could still be mounted refers to them any more.
-    pub fn release_queued(&mut self, c: &Container) -> Result<()> {
-        let xid = self.xid;
-        let ip_old: Vec<FqEntry> = self.fq[SFQ_IP].iter().filter(|e| e.xid < xid).copied().collect();
-        self.fq[SFQ_IP].retain(|e| e.xid >= xid);
+    pub fn release_queued(&mut self, c: &Container, durable: u64) -> Result<()> {
+        // A block freed in transaction x is unused from checkpoint x on, but
+        // checkpoint x-1 still uses it: it is free once x is on the disk.
+        let ip_old: Vec<FqEntry> = self.fq[SFQ_IP].iter().filter(|e| e.xid <= durable).copied().collect();
+        self.fq[SFQ_IP].retain(|e| e.xid > durable);
         for e in ip_old {
             for b in e.paddr..e.paddr + e.count {
                 let i = (b - self.sm.ip_base) as usize;
@@ -368,8 +369,8 @@ impl Space {
                 self.ip_dirty[i / (self.bs as usize * 8)] = true;
             }
         }
-        let main_old: Vec<FqEntry> = self.fq[SFQ_MAIN].iter().filter(|e| e.xid < xid).copied().collect();
-        self.fq[SFQ_MAIN].retain(|e| e.xid >= xid);
+        let main_old: Vec<FqEntry> = self.fq[SFQ_MAIN].iter().filter(|e| e.xid <= durable).copied().collect();
+        self.fq[SFQ_MAIN].retain(|e| e.xid > durable);
         let bpc = self.sm.blocks_per_chunk as u64;
         for e in main_old {
             for b in e.paddr..e.paddr + e.count {

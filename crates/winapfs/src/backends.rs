@@ -78,6 +78,85 @@ pub struct ApfsRwBackend {
     generation: AtomicU64,
     /// Free bytes as of a transaction: (xid, bytes).
     free: Mutex<(u64, u64)>,
+    /// One commit at a time; changes keep coming while it is written.
+    commit_lock: Mutex<()>,
+    /// The last file's extents, valid while `generation` is unchanged.
+    extents: Mutex<Option<(u64, u64, Arc<Vec<Extent>>)>>,
+    /// Extra handles on the disk, for reading pieces in parallel.
+    readers: Mutex<Vec<Box<dyn apfs::BlockDevice>>>,
+    /// The window after the current one, being read in the background.
+    prefetch: Mutex<Option<Prefetch>>,
+    prefetch_readers: Arc<Mutex<Vec<Box<dyn apfs::BlockDevice>>>>,
+}
+
+/// The next window of a sequential reader, read without the session lock.
+/// Only a change can free and reuse a block, and every change bumps the
+/// generation: a prefetch is used only if the generation is still the one
+/// it started under.
+struct Prefetch {
+    id: u64,
+    generation: u64,
+    start: u64,
+    done: std::thread::JoinHandle<apfs::Result<Vec<u8>>>,
+}
+
+/// Reads file bytes `start..start + data.len()` (block-aligned) through
+/// `extents`, in pieces on several disk handles at once, lowest first.
+fn fetch_pieces(devs: &[Box<dyn apfs::BlockDevice>], extents: &[Extent], bs: u64, blocks: u64, start: u64, data: &mut [u8]) -> apfs::Result<()> {
+    let mut pieces: Vec<(u64, &mut [u8])> = data.chunks_mut(PIECE).enumerate().map(|(i, c)| (start + (i * PIECE) as u64, c)).collect();
+    if pieces.len() == 1 {
+        let (at, out) = pieces.pop().unwrap();
+        return read_piece(&*devs[0], extents, bs, blocks, at, out);
+    }
+    pieces.reverse(); // taken from the end: lowest address first
+    let workers = pieces.len().min(devs.len());
+    let jobs = Mutex::new(pieces);
+    let failed: Mutex<Option<apfs::Error>> = Mutex::new(None);
+    std::thread::scope(|sc| {
+        for dev in devs.iter().take(workers) {
+            let (jobs, failed) = (&jobs, &failed);
+            sc.spawn(move || loop {
+                let Some((at, out)) = jobs.lock().unwrap().pop() else { break };
+                if let Err(e) = read_piece(&**dev, extents, bs, blocks, at, out) {
+                    *failed.lock().unwrap() = Some(e);
+                    break;
+                }
+            });
+        }
+    });
+    match failed.into_inner().unwrap() {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+fn open_readers(s: &Session, pool: &mut Vec<Box<dyn apfs::BlockDevice>>) -> Result<(), NTSTATUS> {
+    while pool.len() < READERS {
+        pool.push(s.open_reader().map_err(status)?);
+    }
+    Ok(())
+}
+
+/// Reads file bytes `at..at + out.len()` (block-aligned) through `extents`.
+/// Holes stay as they are (zeros).
+fn read_piece(dev: &dyn apfs::BlockDevice, extents: &[Extent], bs: u64, blocks: u64, at: u64, out: &mut [u8]) -> apfs::Result<()> {
+    let end = at + out.len() as u64;
+    let first = extents.partition_point(|e| e.logical <= at).saturating_sub(1);
+    for e in &extents[first..] {
+        if e.logical >= end {
+            break;
+        }
+        let e_end = e.logical + e.len.div_ceil(bs) * bs;
+        let (s, t) = (at.max(e.logical), end.min(e_end));
+        if s >= t || e.phys_block == 0 {
+            continue;
+        }
+        if e.phys_block + e.len.div_ceil(bs) > blocks {
+            return Err(apfs::Error::Corrupt(format!("an extent runs past the container: block {:#x}", e.phys_block)));
+        }
+        dev.read_at(e.phys_block * bs + (s - e.logical), &mut out[(s - at) as usize..(t - at) as usize])?;
+    }
+    Ok(())
 }
 
 /// Free bytes in the committed state, with the transaction they are from.
@@ -99,7 +178,11 @@ struct ReadWindow {
 /// USB link every one costs a round trip, so sequential readers get ever
 /// larger fetches.
 const READ_AHEAD_MIN: usize = 256 * 1024;
-const READ_AHEAD_MAX: usize = 8 * 1024 * 1024;
+const READ_AHEAD_MAX: usize = 16 * 1024 * 1024;
+/// A fetch is read in pieces this big on up to [`READERS`] handles at once:
+/// a Samsung T7 reads ~720 MB/s one request at a time, ~1 GB/s with several.
+const PIECE: usize = 2 * 1024 * 1024;
+const READERS: usize = 4;
 
 /// Changes are committed once the volume has been quiet this long...
 const COMMIT_AFTER_QUIET: Duration = Duration::from_millis(1000);
@@ -121,6 +204,11 @@ impl ApfsRwBackend {
         let free = free_space(&s, total, block_size);
         Ok(Self {
             free: Mutex::new(free),
+            commit_lock: Mutex::new(()),
+            extents: Mutex::new(None),
+            readers: Mutex::new(Vec::new()),
+            prefetch: Mutex::new(None),
+            prefetch_readers: Arc::new(Mutex::new(Vec::new())),
             s: Mutex::new(s),
             label,
             rule,
@@ -156,18 +244,23 @@ impl ApfsRwBackend {
 
     fn check_lost(&self, s: &mut Session) {
         if let Some(why) = s.take_lost() {
-            self.failed.store(true, Ordering::SeqCst);
-            crate::trace::log(&format!(
-                "winapfs: changes from the last few seconds could not be saved ({why}). \
-                 The drive now refuses changes to keep the rest safe: unmount it, plug it back in, \
-                 and check the files you copied most recently."
-            ));
+            self.fail(&why);
         }
     }
 
+    fn fail(&self, why: &str) {
+        self.failed.store(true, Ordering::SeqCst);
+        crate::trace::log(&format!(
+            "winapfs: changes from the last few seconds could not be saved ({why}). \
+             The drive now refuses changes to keep the rest safe: unmount it, plug it back in, \
+             and check the files you copied most recently."
+        ));
+    }
+
     /// Reads committed data through a window that grows while reads stay
-    /// sequential. Runs under the session lock, so no change slips in.
-    fn read_ahead(&self, v: &Volume, inode: &Inode, off: u64, buf: &mut [u8]) -> Result<usize, NTSTATUS> {
+    /// sequential. Runs under the session lock, so no block it reads can be
+    /// freed and reused meanwhile.
+    fn read_ahead(&self, s: &Session, v: &Volume, inode: &Inode, off: u64, buf: &mut [u8]) -> Result<usize, NTSTATUS> {
         let size = v.file_size(inode).map_err(status)?;
         if off >= size {
             return Ok(0);
@@ -184,14 +277,55 @@ impl ApfsRwBackend {
         }
         let sequential = same && off >= w.start && off <= end;
         let next_fetch = if sequential { (w.next_fetch * 2).clamp(READ_AHEAD_MIN, READ_AHEAD_MAX) } else { READ_AHEAD_MIN };
-        let fetch = (next_fetch.max(want) as u64).min(size - off) as usize;
-        let mut data = vec![0u8; fetch];
-        let n = v.read_at(inode, off, &mut data).map_err(status)?;
-        data.truncate(n);
-        let k = want.min(n);
-        buf[..k].copy_from_slice(&data[..k]);
-        *w = ReadWindow { id: inode.id, generation, start: off, data, next_fetch };
+        // Whole blocks, so the disk can be read without bouncing through a buffer.
+        let (bs, blocks) = (self.block_size, self.total / self.block_size);
+        let start = off / bs * bs;
+        let extents = self.extents_of(v, inode, generation)?;
+        let prefetched = match self.prefetch.lock().unwrap().take() {
+            Some(p) if p.id == inode.id && p.generation == generation && p.start == start => p.done.join().ok().and_then(Result::ok),
+            _ => None, // one for elsewhere finishes on its own
+        };
+        let mut data = match prefetched {
+            Some(d) if d.len() >= (off - start) as usize + want => d,
+            _ => {
+                let stop = (off + next_fetch.max(want) as u64).min(size).div_ceil(bs) * bs;
+                let mut d = vec![0u8; (stop - start) as usize];
+                let mut pool = self.readers.lock().unwrap();
+                open_readers(s, &mut pool)?;
+                fetch_pieces(&pool, &extents, bs, blocks, start, &mut d).map_err(status)?;
+                d
+            }
+        };
+        data.truncate((size - start).min(data.len() as u64) as usize);
+        let at = (off - start) as usize;
+        let k = want.min(data.len() - at);
+        buf[..k].copy_from_slice(&data[at..at + k]);
+        // A sequential reader will want the next window: start reading it now.
+        let end = start + data.len() as u64;
+        if sequential && end < size && end % bs == 0 {
+            let stop = (end + next_fetch as u64).min(size).div_ceil(bs) * bs;
+            let (pool, ext) = (Arc::clone(&self.prefetch_readers), Arc::clone(&extents));
+            open_readers(s, &mut pool.lock().unwrap())?;
+            let done = std::thread::spawn(move || {
+                let mut d = vec![0u8; (stop - end) as usize];
+                fetch_pieces(&pool.lock().unwrap(), &ext, bs, blocks, end, &mut d).map(|()| d)
+            });
+            *self.prefetch.lock().unwrap() = Some(Prefetch { id: inode.id, generation, start: end, done });
+        }
+        *w = ReadWindow { id: inode.id, generation, start, data, next_fetch };
         Ok(k)
+    }
+
+    fn extents_of(&self, v: &Volume, inode: &Inode, generation: u64) -> Result<Arc<Vec<Extent>>, NTSTATUS> {
+        let mut cache = self.extents.lock().unwrap();
+        if let Some((id, g, e)) = &*cache {
+            if *id == inode.id && *g == generation {
+                return Ok(Arc::clone(e));
+            }
+        }
+        let e = Arc::new(v.file_extents(inode).map_err(status)?);
+        *cache = Some((inode.id, generation, Arc::clone(&e)));
+        Ok(e)
     }
 
     /// Records a change: the committer waits for a quiet moment.
@@ -287,7 +421,7 @@ impl Backend for ApfsRwBackend {
         let v = s.volume().map_err(status)?;
         let inode = v.inode(id).map_err(status)?;
         if !inode.is_compressed() {
-            return self.read_ahead(&v, &inode, off, buf);
+            return self.read_ahead(&s, &v, &inode, off, buf);
         }
         let mut cache = self.decompressed.lock().unwrap();
         let data = match &*cache {
@@ -363,16 +497,27 @@ impl Backend for ApfsRwBackend {
         })
     }
 
-    /// Commits everything collected so far.
+    /// Commits everything collected so far and returns once it is on the
+    /// disk. Only preparing the commit holds the session: changes keep
+    /// coming while it is written, into the next commit.
     fn flush(&self) -> Result<(), NTSTATUS> {
-        let start = Instant::now();
-        let mut s = self.session();
-        let _t = Timer("flush".to_string(), start);
-        // Taken under the session lock, so changes made meanwhile wait for the next commit.
-        self.activity.lock().unwrap().1 = None;
-        let r = s.flush();
-        self.check_lost(&mut s);
-        r.map_err(status)
+        let _t = Timer("flush".to_string(), Instant::now());
+        let _one = self.commit_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let prepared = {
+            let mut s = self.session();
+            // Taken under the session lock, so changes made meanwhile wait for the next commit.
+            self.activity.lock().unwrap().1 = None;
+            let r = s.prepare_flush();
+            self.check_lost(&mut s);
+            r.map_err(status)?
+        };
+        if let Some(p) = prepared {
+            if let Err(e) = p.persist() {
+                self.fail(&e.to_string());
+                return Err(status(e));
+            }
+        }
+        Ok(())
     }
 
     /// A file written through this mount was closed: the committer saves it
