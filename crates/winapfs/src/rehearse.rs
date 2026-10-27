@@ -276,6 +276,25 @@ fn sparse_file(path: &Path, len: u64) -> CliResult<File> {
 
 const UNDO_MAGIC: &[u8; 8] = b"WAPFSUN1";
 
+/// `dev-bench-write <source> [MiB]`: raw write speed into free space (see
+/// `apfs::write::bench_raw_writes`); nothing is committed.
+pub fn bench_write(src: &str, mib: u64, part: Option<u32>) -> CliResult {
+    let (dev, location, path, base) = open_device(src, part)?;
+    let c = Container::open(Box::new(dev))?;
+    let uuid = c.sb.uuid;
+    drop(c);
+    println!("== {location}: writing {mib} MiB of test data into free space, several times");
+    for (chunk, secs, flush) in apfs::write::bench_raw_writes(Path::new(&path), base, uuid, mib, &[8 << 20, 2 << 20, 256 << 10, 64 << 10])? {
+        println!(
+            "  pieces of {:>5} KiB: {:6.1} MB/s ({secs:.2} s), flush {flush:.2} s",
+            chunk / 1024,
+            mib as f64 * 1.048576 / secs.max(1e-6)
+        );
+    }
+    println!("nothing committed: the container is unchanged");
+    Ok(())
+}
+
 /// Parses `E0BAE11E-CADF-4226-BD15-E0B7FFB82FDC` into the bytes stored on disk.
 fn parse_uuid(s: &str) -> CliResult<[u8; 16]> {
     let hex: String = s.chars().filter(|c| *c != '-').collect();

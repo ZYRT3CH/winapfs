@@ -67,6 +67,8 @@ pub struct Space {
     run_hint: usize,
     /// Chunk where the last big run was found; earlier ones have none.
     big_hint: usize,
+    /// Chunk bitmaps read from the disk in this transaction.
+    pub bitmap_reads: usize,
 }
 
 impl Space {
@@ -145,6 +147,7 @@ impl Space {
             fq_old_nodes: fq_old_nodes.into_inner(),
             run_hint: 0,
             big_hint: 0,
+            bitmap_reads: 0,
         })
     }
 
@@ -194,7 +197,12 @@ impl Space {
     fn bitmap(&mut self, c: &Container, ch: usize) -> Result<&mut Vec<u8>> {
         if !self.bitmaps.contains_key(&ch) {
             let addr = self.chunk_bitmap_addr(ch);
-            let bm = if addr == 0 { vec![0u8; self.bs as usize] } else { c.raw_block(addr)? };
+            let bm = if addr == 0 {
+                vec![0u8; self.bs as usize]
+            } else {
+                self.bitmap_reads += 1;
+                c.raw_block(addr)?
+            };
             self.bitmaps.insert(ch, bm);
         }
         Ok(self.bitmaps.get_mut(&ch).unwrap())

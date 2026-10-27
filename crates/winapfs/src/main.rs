@@ -9,6 +9,7 @@ mod disks;
 mod dump;
 #[cfg(windows)]
 mod rehearse;
+mod trace;
 #[cfg(windows)]
 mod mountfs;
 #[cfg(windows)]
@@ -160,6 +161,7 @@ fn main() -> ExitCode {
     let double_clicked = std::env::args().len() == 1 && owns_console();
     #[cfg(not(windows))]
     let double_clicked = false;
+    trace::init();
     let result = if double_clicked { service::install() } else { parse_args().and_then(|a| run(&a)) };
     let code = match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -430,6 +432,11 @@ fn run(a: &Args) -> CliResult {
         "dev-real-write" => {
             need(4)?;
             rehearse::real_write(&a.pos[0], &a.pos[1], &a.pos[2], Path::new(&a.pos[3]), a.vol, a.part)
+        }
+        "dev-bench-write" => {
+            need(1)?;
+            let mib = a.pos.get(1).and_then(|s| s.parse().ok()).unwrap_or(64);
+            rehearse::bench_write(&a.pos[0], mib, a.part)
         }
         "dev-undo" => {
             need(2)?;

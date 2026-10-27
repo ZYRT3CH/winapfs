@@ -56,6 +56,30 @@ pub(crate) fn put_u64(b: &mut [u8], off: usize, v: u64) {
     b[off..off + 8].copy_from_slice(&v.to_le_bytes());
 }
 
+static TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LOG: std::sync::OnceLock<fn(&str)> = std::sync::OnceLock::new();
+
+/// Turns on timing messages for every transaction, not only slow ones.
+pub fn set_trace(on: bool) {
+    TRACE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Where timing and diagnostic messages go (standard error unless set).
+pub fn set_log(f: fn(&str)) {
+    let _ = LOG.set(f);
+}
+
+fn tracing() -> bool {
+    TRACE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn log(msg: &str) {
+    match LOG.get() {
+        Some(f) => f(msg),
+        None => eprintln!("{msg}"),
+    }
+}
+
 fn now_ns() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64)
 }
@@ -147,8 +171,8 @@ impl Writer {
         let xid = self.c.sb.next_xid;
         let mut space = Space::load(&self.c, xid)?;
         space.release_queued(&self.c)?;
-        if start.elapsed().as_secs_f64() > 0.5 || std::env::var_os("WINAPFS_TRACE").is_some() {
-            eprintln!("winapfs: starting transaction {xid} took {:.2} s", start.elapsed().as_secs_f64());
+        if start.elapsed().as_secs_f64() > 0.5 || tracing() {
+            log(&format!("winapfs: starting transaction {xid} took {:.2} s", start.elapsed().as_secs_f64()));
         }
         Ok(Txn { xid, space, writes: Vec::new(), nx_omap_oid: None, next_oid: self.c.sb.next_oid })
     }
@@ -265,6 +289,7 @@ impl Writer {
         let t_start = Instant::now();
         let Txn { xid, space, mut writes, nx_omap_oid, next_oid } = t;
         let mut next_oid = next_oid;
+        let bitmap_reads = space.bitmap_reads;
         let (objects, dropped) = space.finish(&mut writes, &mut next_oid)?;
         // New ephemeral objects (more free-queue nodes) join the checkpoint map.
         let added: Vec<CheckpointMapping> = objects
@@ -399,16 +424,16 @@ impl Writer {
             return Err(corrupt(format!("after committing xid {xid} the newest checkpoint is {}", self.c.xid())));
         }
         let total = t_start.elapsed();
-        if total.as_secs_f64() > 1.0 || std::env::var_os("WINAPFS_TRACE").is_some() {
-            eprintln!(
-                "winapfs: commit {xid} took {:.2} s: prepare {:.2}, write {:.2}, flushes {:.2} (first {:.2}), reload {:.2}",
+        if total.as_secs_f64() > 1.0 || tracing() {
+            log(&format!(
+                "winapfs: commit {xid} took {:.2} s ({bitmap_reads} bitmaps read): prepare {:.2}, write {:.2}, flushes {:.2} (first {:.2}), reload {:.2}",
                 total.as_secs_f64(),
                 (t_write - t_start).as_secs_f64(),
                 (t_flush - t_write).as_secs_f64(),
                 (t_reload - t_flush).as_secs_f64(),
                 flush1.as_secs_f64(),
                 t_reload.elapsed().as_secs_f64()
-            );
+            ));
         }
         Ok(xid)
     }
@@ -636,6 +661,44 @@ pub fn restore_blocks(path: &Path, base: u64, expected_uuid: [u8; 16], blocks: &
         dev.write_at(paddr * bs, data)?;
     }
     dev.flush()
+}
+
+/// Measures raw write speed on the container at byte `base` of `path`:
+/// reserves `mib` MiB of free space in a transaction that is never
+/// committed, writes test data there in pieces of each size in `chunks`,
+/// and returns (piece size, seconds, seconds to flush). Nothing in use is
+/// touched and the container does not change.
+pub fn bench_raw_writes(path: &Path, base: u64, expected_uuid: [u8; 16], mib: u64, chunks: &[usize]) -> Result<Vec<(usize, f64, f64)>> {
+    let w = Writer::open_real_disk(path, base, expected_uuid)?;
+    let mut t = w.begin()?;
+    let bs = w.c.block_size() as u64;
+    let want = mib * 1024 * 1024 / bs;
+    let mut runs = Vec::new();
+    let mut got = 0;
+    while got < want {
+        let (start, n) = t.space.alloc_run(&w.c, want - got)?;
+        runs.push((start, n));
+        got += n;
+    }
+    let pattern: Vec<u8> = (0..16 << 20).map(|i: u32| (i % 251) as u8).collect();
+    let mut out = Vec::new();
+    for &chunk in chunks {
+        let start = Instant::now();
+        for &(first, n) in &runs {
+            let (mut off, end) = (first * bs, (first + n) * bs);
+            while off < end {
+                let len = (chunk as u64).min(end - off) as usize;
+                w.dev.write_at(off, &pattern[..len])?;
+                off += len as u64;
+            }
+        }
+        let wrote = start.elapsed().as_secs_f64();
+        let f = Instant::now();
+        w.dev.flush()?;
+        out.push((chunk, wrote, f.elapsed().as_secs_f64()));
+    }
+    drop(t); // never committed: the blocks stay free
+    Ok(out)
 }
 
 /// What would stop this crate from writing to container `c`, found by

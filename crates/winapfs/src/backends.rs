@@ -132,6 +132,7 @@ impl Backend for ApfsRwBackend {
     }
 
     fn total_and_free(&self) -> (u64, u64) {
+        let _t = Timer("volume info".to_string(), Instant::now());
         let s = self.session();
         let used: u64 = s.container().volume_superblocks().map_or(0, |v| v.iter().map(|v| v.alloc_blocks).sum());
         (self.total, self.total.saturating_sub(used * self.block_size))
@@ -158,7 +159,9 @@ impl Backend for ApfsRwBackend {
     }
 
     fn list(&self, dir: u64) -> Result<Vec<(String, Meta)>, NTSTATUS> {
+        let start = Instant::now();
         let mut s = self.session();
+        let _t = Timer(format!("list {dir}"), start);
         let entries = s.list(dir).map_err(status)?;
         let v = s.volume().map_err(status)?;
         Ok(entries.into_iter().map(|(name, inode)| (name, meta_of(&v, &inode))).collect())
@@ -177,7 +180,9 @@ impl Backend for ApfsRwBackend {
     }
 
     fn read(&self, id: u64, off: u64, buf: &mut [u8]) -> Result<usize, NTSTATUS> {
+        let start = Instant::now();
         let mut s = self.session();
+        let _t = Timer(format!("read {} bytes at {off} of {id}", buf.len()), start);
         if let Some(n) = s.read_pending(id, off, buf).map_err(status)? {
             return Ok(n);
         }
@@ -205,7 +210,9 @@ impl Backend for ApfsRwBackend {
     }
 
     fn stat(&self, id: u64) -> Result<Meta, NTSTATUS> {
+        let start = Instant::now();
         let mut s = self.session();
+        let _t = Timer(format!("stat {id}"), start);
         let pending = s.pending_size(id);
         let inode = s.inode(id).map_err(status)?;
         let v = s.volume().map_err(status)?;
@@ -217,6 +224,7 @@ impl Backend for ApfsRwBackend {
     }
 
     fn create(&self, dir: u64, name: &str, is_dir: bool) -> Result<Meta, NTSTATUS> {
+        let _t = Timer(format!("create {name:?} in {dir}"), Instant::now());
         let kind = if is_dir { NewKind::Folder } else { NewKind::File };
         let id = self.session().create(dir, name, kind).map_err(status)?;
         self.changed();
@@ -224,31 +232,37 @@ impl Backend for ApfsRwBackend {
     }
 
     fn write(&self, id: u64, off: u64, data: &[u8]) -> Result<u64, NTSTATUS> {
+        let start = Instant::now();
         let mut s = self.session();
+        let _t = Timer(format!("write {} bytes at {off} of {id}", data.len()), start);
         s.write(id, off, data).map_err(status)?;
         self.changed();
         Ok(s.pending_size(id).unwrap_or(off + data.len() as u64))
     }
 
     fn set_size(&self, id: u64, size: u64) -> Result<(), NTSTATUS> {
+        let _t = Timer(format!("set size of {id} to {size}"), Instant::now());
         self.session().set_size(id, size).map_err(status)?;
         self.changed();
         Ok(())
     }
 
     fn remove(&self, dir: u64, name: &str) -> Result<(), NTSTATUS> {
+        let _t = Timer(format!("remove {name:?} from {dir}"), Instant::now());
         self.session().remove(dir, name).map_err(status)?;
         self.changed();
         Ok(())
     }
 
     fn rename(&self, sdir: u64, sname: &str, ddir: u64, dname: &str, replace: bool) -> Result<(), NTSTATUS> {
+        let _t = Timer(format!("rename {sname:?}"), Instant::now());
         self.session().rename(sdir, sname, ddir, dname, replace).map_err(status)?;
         self.changed();
         Ok(())
     }
 
     fn set_info(&self, id: u64, t: SetTimes, hidden: Option<bool>) -> Result<(), NTSTATUS> {
+        let _t = Timer(format!("set info of {id}"), Instant::now());
         let mut s = self.session();
         if t.create.is_some() || t.access.is_some() || t.write.is_some() || t.change.is_some() {
             let times = Times { create: t.create, modify: t.write, change: t.change, access: t.access };
@@ -263,7 +277,9 @@ impl Backend for ApfsRwBackend {
 
     /// Commits everything collected so far.
     fn flush(&self) -> Result<(), NTSTATUS> {
+        let start = Instant::now();
         let mut s = self.session();
+        let _t = Timer("flush".to_string(), start);
         // Taken under the session lock, so changes made meanwhile wait for the next commit.
         self.activity.lock().unwrap().1 = None;
         s.flush().map_err(status)
@@ -480,5 +496,14 @@ impl Backend for DemoBackend {
 
     fn open(&'static self, file: &Meta) -> Result<Box<dyn FileReader>, NTSTATUS> {
         Ok(Box::new(MemReader(self.nodes[(file.id - 2) as usize].data.clone())))
+    }
+}
+
+/// Reports an operation's duration when dropped, if slow (see `trace`).
+struct Timer(String, Instant);
+
+impl Drop for Timer {
+    fn drop(&mut self) {
+        crate::trace::slow(&self.0, self.1);
     }
 }
