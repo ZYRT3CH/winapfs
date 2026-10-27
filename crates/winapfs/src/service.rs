@@ -214,7 +214,8 @@ pub fn setup(remove: bool) -> CliResult {
 
 /// `winapfs install`: everything a new user needs, asking for admin rights once.
 pub fn install() -> CliResult {
-    println!("winapfs shows Mac (APFS) drives in Windows Explorer. It only reads; it never changes the Mac drive.");
+    println!("winapfs shows Mac (APFS) drives in Windows Explorer. They open read-only, so nothing changes by accident;");
+    println!("to save files onto them too, run `winapfs write on` afterwards (beta).");
     println!();
     if Launcher::load().is_err() {
         println!("winapfs needs WinFsp, a free helper that lets programs act as drives (https://winfsp.dev).");
@@ -448,6 +449,74 @@ pub fn is_elevated() -> bool {
         let ok = GetTokenInformation(token, TOKEN_ELEVATION, (&mut elevated as *mut u32).cast(), 4, &mut ret);
         CloseHandle(token);
         ok != 0 && elevated != 0
+    }
+}
+
+/// The write-mode switch: a file in the install folder, which only
+/// administrators can change.
+fn write_switch() -> PathBuf {
+    install_dir().join("write-mode.on")
+}
+
+/// Whether plugged-in Mac drives are mounted writable.
+pub fn write_mode() -> bool {
+    write_switch().exists()
+}
+
+/// `winapfs write [on|off]`
+pub fn write_command(arg: Option<&str>) -> CliResult {
+    match arg {
+        None | Some("status") => {
+            if write_mode() {
+                println!("write mode is ON: Mac drives you plug in appear writable (EXPERIMENTAL)");
+                println!("turn off: winapfs write off");
+            } else {
+                println!("write mode is off: Mac drives you plug in appear read-only");
+                println!("turn on:  winapfs write on   (EXPERIMENTAL: back up what you cannot lose)");
+            }
+            Ok(())
+        }
+        Some(a @ ("on" | "off")) => {
+            if !is_elevated() {
+                println!("Windows will ask for permission.");
+                run_elevated(&format!("write {a}"))?;
+                return write_command(None);
+            }
+            if a == "on" {
+                std::fs::write(write_switch(), "Mac drives are mounted writable. Remove this file (winapfs write off) to stop.\r\n")
+                    .map_err(|e| CliError::new(format!("could not turn write mode on: {e}")))?;
+            } else if write_mode() {
+                std::fs::remove_file(write_switch()).map_err(|e| CliError::new(format!("could not turn write mode off: {e}")))?;
+            }
+            remount_all(if a == "on" { MountMode::Write } else { MountMode::ReadOnly });
+            Ok(())
+        }
+        Some(other) => Err(CliError::new(format!("`winapfs write {other}`: say on or off"))),
+    }
+}
+
+/// Mounts the Mac drives shown now again in `mode`, so a change of write
+/// mode applies at once.
+fn remount_all(mode: MountMode) {
+    let Ok(l) = Launcher::load() else { return };
+    let running: Vec<String> =
+        l.running().unwrap_or_default().into_iter().filter(|(c, _)| c == CLASS).map(|(_, i)| i).collect();
+    for inst in running {
+        let Some(disk) = l.info(CLASS, &inst).ok().and_then(|info| {
+            info.iter().find_map(|s| s.split(' ').find_map(|t| t.trim_matches('"').strip_prefix("src=").map(str::to_string)))
+        }) else {
+            continue;
+        };
+        println!("remounting {inst}: ({disk})");
+        let _ = l.stop(CLASS, &inst);
+        let root = format!("{inst}:\\");
+        let t = Instant::now();
+        while Path::new(&root).exists() && t.elapsed() < Duration::from_secs(15) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        if let Err(e) = mount(&disk, &format!("{inst}:"), 0, None, mode) {
+            println!("could not remount {inst}: {}", e.msg);
+        }
     }
 }
 

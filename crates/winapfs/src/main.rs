@@ -1,4 +1,4 @@
-//! winapfs: read Mac (APFS) drives on Windows.
+//! winapfs: use Mac (APFS) drives on Windows, read and write.
 
 #[cfg(windows)]
 mod automount;
@@ -28,8 +28,8 @@ use apfs::check::{check_volume, CheckOptions};
 use apfs::write::{NewKind, Session};
 use apfs::{format_uuid, gpt, Container, FileDevice, FileKind, Inode, Volume};
 
-const USAGE: &str = r"winapfs - read Mac (APFS) drives on Windows.
-The disk is opened without write access, so nothing on it can change.
+const USAGE: &str = r"winapfs - use Mac (APFS) drives on Windows: read them, and write them (beta).
+Drives are opened read-only unless you ask for writing (--write, or winapfs write on).
 
 usage:
   winapfs info <source>
@@ -37,7 +37,9 @@ usage:
   winapfs get  <source> <path> <dest-folder> [--vol N] [--all] [--dry-run]
   winapfs cat  <source> <path> [--vol N]
   winapfs verify <source> [--vol N]      check the whole volume reads correctly
-  winapfs mount  <source> <X: or new-folder> [--vol N]   show the volume in Windows, read-only
+  winapfs mount  <source> <X: or new-folder> [--vol N]   show the volume in Windows (read-only,
+                 or with --write / --rehearse: writable)
+  winapfs write [on|off]                 plugged-in Mac drives appear writable (beta), or not
   winapfs unmount <X: or folder or all>
   winapfs mounts                         list mounted drive letters
   winapfs disks                          list connected disks with a Mac (APFS) partition
@@ -295,6 +297,8 @@ fn run(a: &Args) -> CliResult {
             need(1)?;
             dump::dump(&a.pos[0], a.part)
         }
+        #[cfg(windows)]
+        "write" => service::write_command(a.pos.first().map(String::as_str)),
         "dev-records" => {
             need(2)?;
             let id = u64::from_str_radix(a.pos[1].trim_start_matches("0x"), if a.pos[1].starts_with("0x") { 16 } else { 10 })
@@ -854,28 +858,23 @@ fn cmd_mount(src: Option<&str>, mount_point: &str, vol: usize, part: Option<u32>
             .hint("WinFsp creates the mount folder itself; pick a path that does not exist yet"));
     }
     let mut rw: Option<&'static backends::ApfsRwBackend> = None;
-    let (backend, what): (&'static dyn mountfs::Backend, String) = match src {
-        Some(src) if mode != MountMode::ReadOnly => {
-            let (dev, location, path, base) = open_device(src, part)?;
-            let c = Container::open(Box::new(dev.try_clone()?))?;
-            let problems = apfs::write::check_writable(&c);
-            if !problems.is_empty() {
-                return Err(CliError::new(format!("cannot write to {location}: {}", problems.join("; "))));
+    let mut mode = mode;
+    if let (Some(src), true) = (src, mode != MountMode::ReadOnly) {
+        match open_writable(src, part, vol, mode) {
+            Ok(b) => rw = Some(b),
+            Err(e) => {
+                // The files stay reachable: show the drive read-only instead.
+                eprintln!("winapfs: not mounting writable: {}; mounting read-only instead", e.msg);
+                println!("note      not writable: {}; mounted read-only instead", e.msg);
+                mode = MountMode::ReadOnly;
             }
-            // Never build on a space map that is already wrong.
-            println!("checking  the free-space map before writing (reads all metadata; about half a minute on a big drive)");
-            dump::space_check_container(&c, &location)
-                .map_err(|e| CliError::new(format!("not mounting writable: {}", e.msg)))?;
-            let uuid = c.sb.uuid;
-            drop(c);
-            let s = match mode {
-                MountMode::Rehearse => apfs::write::Session::rehearsal(dev, vol)?.0,
-                _ => apfs::write::Session::open_real_disk(Path::new(&path), base, uuid, vol)?,
-            };
-            let b: &'static backends::ApfsRwBackend = Box::leak(Box::new(backends::ApfsRwBackend::from_session(s)?));
+        }
+    }
+    let (backend, what): (&'static dyn mountfs::Backend, String) = match src {
+        Some(src) if rw.is_some() => {
+            let b = rw.unwrap();
             b.start_committer();
-            rw = Some(b);
-            (b, format!("volume {vol} \"{}\" from {location}", mountfs::Backend::label(b)))
+            (b, format!("volume {vol} \"{}\" from {src}", mountfs::Backend::label(b)))
         }
         Some(src) => {
             let (c, location) = open_source(src, part)?;
@@ -908,6 +907,27 @@ fn cmd_mount(src: Option<&str>, mount_point: &str, vol: usize, part: Option<u32>
         }
     }
     Ok(())
+}
+
+/// Opens a volume for a writable (or rehearsal) mount, after checking that
+/// nothing blocks writing and that the free-space map is consistent: never
+/// build on a space map that is already wrong.
+fn open_writable(src: &str, part: Option<u32>, vol: usize, mode: MountMode) -> CliResult<&'static backends::ApfsRwBackend> {
+    let (dev, location, path, base) = open_device(src, part)?;
+    let c = Container::open(Box::new(dev.try_clone()?))?;
+    let problems = apfs::write::check_writable(&c);
+    if !problems.is_empty() {
+        return Err(CliError::new(format!("this drive uses something winapfs cannot write yet ({})", problems.join("; "))));
+    }
+    println!("checking  the free-space map before writing (reads all metadata; about half a minute on a big drive)");
+    dump::space_check_container(&c, &location).map_err(|e| CliError::new(format!("the drive did not pass the check ({})", e.msg)))?;
+    let uuid = c.sb.uuid;
+    drop(c);
+    let s = match mode {
+        MountMode::Rehearse => apfs::write::Session::rehearsal(dev, vol)?.0,
+        _ => apfs::write::Session::open_real_disk(Path::new(&path), base, uuid, vol)?,
+    };
+    Ok(Box::leak(Box::new(backends::ApfsRwBackend::from_session(s)?)))
 }
 
 /// How `cmd_mount` mounts a volume.

@@ -83,7 +83,10 @@ fn poll(l: &Launcher, st: &mut State, log: &mut dyn FnMut(&str)) {
             log("no free drive letter for a Mac drive");
             break;
         };
-        let args = [format!("src=disk{d}"), format!("at={letter}:"), "vol=0".to_string()];
+        let mut args = vec![format!("src=disk{d}"), format!("at={letter}:"), "vol=0".to_string()];
+        if crate::service::write_mode() {
+            args.push("mode=write".to_string());
+        }
         match l.start(CLASS, &letter, &args) {
             Ok(()) => {
                 log(&format!("disk{d} plugged in; mounting at {letter}:"));

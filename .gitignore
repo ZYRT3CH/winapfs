@@ -1,2 +1,5 @@
 /target
 *.log
+
+# Local editor and agent settings
+.claude/
