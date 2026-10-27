@@ -15,9 +15,18 @@
 
 <h3 align="center">Plug in a Mac drive. Use it like any other drive.<br>Open your files, copy new ones on, rename, tidy up. On Windows.</h3>
 
+<p align="center">No Mac needed. No paid tools. No reformatting.</p>
+
+<h3 align="center">⚡ Set up in about 10 seconds</h3>
+<p align="center">Paste this into <b>PowerShell</b> or <b>Terminal</b>, then plug in your Mac drive:</p>
+
+```powershell
+irm https://raw.githubusercontent.com/ZYRT3CH/winapfs/main/install.ps1 | iex
+```
+
 <p align="center">
-  No Mac needed. No paid tools. No reformatting.<br>
-  <a href="#-set-it-up-in-2-minutes"><b>Set it up</b></a> ·
+  <sub>Or <a href="https://github.com/ZYRT3CH/winapfs/releases/latest/download/winapfs.exe"><b>download winapfs.exe</b></a> and double-click it. The first time, add a minute if WinFsp (a free helper) needs installing.</sub><br><br>
+  <a href="#-set-it-up-in-seconds"><b>Setup details</b></a> ·
   <a href="#-writing-to-your-mac-drive-beta"><b>Writing (beta)</b></a> ·
   <a href="#-questions"><b>Questions</b></a> ·
   <a href="docs/HOW-IT-WORKS.md"><b>How it works</b></a>
@@ -62,7 +71,7 @@
 
 ---
 
-## 🚀 Set it up in 2 minutes
+## 🚀 Set it up in seconds
 
 You need **Windows 10 or 11, 64-bit**. Pick whichever way you like:
 
