@@ -40,14 +40,14 @@ dependencies = [
 
 [[package]]
 name = "winapfs"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "winapfs-core",
 ]
 
 [[package]]
 name = "winapfs-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "lzfse_rust",
  "miniz_oxide",

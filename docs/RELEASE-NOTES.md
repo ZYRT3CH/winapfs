@@ -1,6 +1,22 @@
 **Your Mac drive, on Windows. Read it. Write it.** Plug in a drive formatted on a Mac (APFS) and it shows up in File Explorer. It opens read-only; turn on write mode and you can save files onto it too (beta).
 
-### What's new in 0.1.2: a lot faster in write mode
+### What's new in 0.1.3: find out why a drive is slow
+
+**`winapfs usb`** checks every USB drive, Mac or not, and tells you why it might be slow: the speed its USB link actually got, whether the port can do better, USB-C, the storage driver (UAS) and Windows' write-cache setting. Anything that can go faster gets a one-line fix. It needs no admin rights and changes nothing, and the downloaded `winapfs.exe` works without any setup (`.\winapfs.exe usb` in its folder).
+
+It catches the problem that slowed a Samsung T7 to about 40 MB/s for hours. Every USB 3 port is really two ports in one, and the drive had connected on the USB 2 half:
+
+```
+1 USB drive, 1 can go faster
+disk3  Samsung PSSD T7  link: USB 2 (480 Mbps), USB-C  driver: UAS  cache: quick removal
+  fix: linked at USB 2 in a port that supports USB 3: replug it firmly, then try the drive's own cable or a port on the back of the PC
+```
+
+Plugged back in, it linked at 10 Gbps and read 829 MB/s.
+
+**Ask Claude to help.** The README has a copy-paste prompt ("Check why my USB drive is slow and help me speed it up") and a ready-made Claude Code skill. Claude runs the checks, explains each finding in plain words, and asks before changing any setting. See [Drive slow? Find out why](https://github.com/ZYRT3CH/winapfs#-drive-slow-find-out-why).
+
+### Also new in 0.1.2: a lot faster in write mode
 
 Measured on a Samsung T7 over USB 3 (10 Gbps), same drive, same port, same test, before and after:
 
