@@ -152,6 +152,48 @@ Before a drive appears writable, winapfs reads its structure and checks the free
 | Show it again | Unplug and plug it back in, or run `winapfs mount auto M:` |
 | Copy files to your PC | Copy them in File Explorer, like from any other drive |
 
+## 🐢 Drive slow? Find out why
+
+A USB drive can quietly run at a fraction of its speed, and Windows won't tell you. Run this in **Terminal** to find out why:
+
+```
+winapfs usb
+```
+
+It checks every USB drive, Mac or not: the speed its USB link actually got, whether the port can do better, USB-C, the storage driver (UAS) and Windows' write-cache setting. Anything you can fix gets a one-line hint. It needs no admin rights and changes nothing. No need to set winapfs up for this: the downloaded `winapfs.exe` works too (`.\winapfs.exe usb` in its folder).
+
+**A real case:** a 2 TB Samsung T7 copied at about 40 MB/s for hours. Every USB 3 port is really two ports in one, a USB 2 half and a USB 3 half, and the drive had connected on the USB 2 half. This is what `winapfs usb` shows for that:
+
+```
+1 USB drive, 1 can go faster
+disk3  Samsung PSSD T7  link: USB 2 (480 Mbps), USB-C  driver: UAS  cache: quick removal
+  fix: linked at USB 2 in a port that supports USB 3: replug it firmly, then try the drive's own cable or a port on the back of the PC
+```
+
+Plugged back in, it linked at 10 Gbps: 829 MB/s reading, 782 MB/s writing. winapfs finds why a drive is slow and how to fix it; it cannot make a drive faster than it is built to be.
+
+### 🤖 Ask Claude to help
+
+Copy this into [Claude](https://claude.ai). In Claude Code it runs the checks itself; elsewhere it tells you what to paste into PowerShell.
+
+```text
+Check why my USB drive is slow and help me speed it up. I'm on Windows.
+
+- If winapfs is installed, run `winapfs usb`. If not, check the same things yourself: the USB link speed my drive actually got (USB 2 or USB 3), whether the port supports faster, whether it's USB-C, the storage driver (UAS or the older USBSTOR) and the write-cache policy (Quick removal or Better performance).
+- Also check Microsoft Defender real-time scanning (it slows copies of many small files) and whether the drive is NTFS, exFAT or APFS.
+- Explain each finding in plain words, with the fix.
+- Don't change any system or security setting (the write-cache policy, Defender exclusions or anything else) without asking me first, and tell me the trade-off of each.
+- If you can't run commands on my PC, tell me what to paste into PowerShell, one step at a time.
+```
+
+### 🧩 Or add it to Claude Code as a skill
+
+The same instructions, as a ready-made [skill](skills/drive-speed/SKILL.md). Copy the `skills/drive-speed` folder into `~/.claude/skills/`, or paste this into PowerShell. Then just tell Claude "my drive is slow".
+
+```powershell
+mkdir "$HOME\.claude\skills\drive-speed" -Force | Out-Null; irm https://raw.githubusercontent.com/ZYRT3CH/winapfs/main/skills/drive-speed/SKILL.md -OutFile "$HOME\.claude\skills\drive-speed\SKILL.md"
+```
+
 ## 🧹 Remove winapfs
 
 Open **Terminal** and run `winapfs uninstall`, then click **Yes** when Windows asks. If you saved `winapfs.exe` somewhere, run it from that folder (`.\winapfs.exe uninstall`) or use the copy in `C:\Program Files\winapfs\`. WinFsp stays installed; you can remove it in **Settings > Apps**.
@@ -179,7 +221,7 @@ Encrypted drives are not supported yet.
 Macs allow a few characters in names that Windows does not, such as `:` or `?`. winapfs shows these as similar-looking symbols so you can still open the files.
 
 **How fast is it?**
-Since v0.1.2, with write mode on, a Samsung T7 over USB 3 (10 Gbps) reads big files at about 829 MB/s, writes them at 782 MB/s and copies 200+ small files a second. Other Mac drives get the same improvements; your drive and USB port set the limit. On a USB 2 port that is only about 35-40 MB/s, so if your drive feels slow, plug it into a blue USB 3 port or a USB-C port on the back of the PC, with the cable that came with the drive.
+Since v0.1.2, with write mode on, a Samsung T7 over USB 3 (10 Gbps) reads big files at about 829 MB/s, writes them at 782 MB/s and copies 200+ small files a second. Other Mac drives get the same improvements; your drive and USB port set the limit. On a USB 2 port that is only about 35-40 MB/s, so if your drive feels slow, plug it into a blue USB 3 port or a USB-C port on the back of the PC, with the cable that came with the drive. Not sure why it is slow? See [Drive slow? Find out why](#-drive-slow-find-out-why).
 
 **The drive did not appear.**
 Run `winapfs disks` in a terminal. It lists connected disks that have a Mac partition. If your drive is listed but no drive letter appears, run `winapfs mount auto M:` to see the error message, and [open an issue](https://github.com/ZYRT3CH/winapfs/issues).
@@ -190,6 +232,7 @@ Run `winapfs disks` in a terminal. It lists connected disks that have a Mac part
 
 ```
 winapfs disks                          list connected Mac disks
+winapfs usb                            why a USB drive is slow, and how to fix it
 winapfs info auto                      show the drive's volumes
 winapfs ls auto /Photos                list a folder
 winapfs get auto /Photos D:\Copy       copy a folder or file to your PC

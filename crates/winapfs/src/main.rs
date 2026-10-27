@@ -15,6 +15,8 @@ mod mountfs;
 #[cfg(windows)]
 mod service;
 #[cfg(windows)]
+mod usb;
+#[cfg(windows)]
 mod winfsp;
 
 use std::collections::HashSet;
@@ -43,6 +45,8 @@ usage:
   winapfs unmount <X: or folder or all>
   winapfs mounts                         list mounted drive letters
   winapfs disks                          list connected disks with a Mac (APFS) partition
+  winapfs usb                            why a USB drive may be slow: its link speed, port and
+                                         driver, with a hint for anything you can fix
   winapfs install                        set everything up (asks for permission once); Mac drives
                                          then appear in Explorer automatically, also after restarts
   winapfs uninstall                      remove what install set up
@@ -275,6 +279,11 @@ fn run(a: &Args) -> CliResult {
             if let Some(n) = found.first() {
                 println!("next: winapfs mount disk{n} M:");
             }
+            Ok(())
+        }
+        #[cfg(windows)]
+        "usb" => {
+            usb::run();
             Ok(())
         }
         #[cfg(windows)]
