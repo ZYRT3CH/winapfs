@@ -1,0 +1,112 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640">
+  <defs>
+    <style>text { white-space: pre; }</style>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0a0f24"/>
+      <stop offset="1" stop-color="#1a0e3a"/>
+    </linearGradient>
+    <linearGradient id="ink" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="0.5" stop-color="#a78bfa"/>
+      <stop offset="1" stop-color="#f472b6"/>
+    </linearGradient>
+    <linearGradient id="frame" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="0.5" stop-color="#a78bfa"/>
+      <stop offset="1" stop-color="#f472b6"/>
+    </linearGradient>
+    <linearGradient id="driveGray" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#d1d5db"/>
+      <stop offset="1" stop-color="#9ca3af"/>
+    </linearGradient>
+    <radialGradient id="glowA"><stop offset="0" stop-color="#06b6d4" stop-opacity="0.45"/><stop offset="1" stop-color="#06b6d4" stop-opacity="0"/></radialGradient>
+    <radialGradient id="glowB"><stop offset="0" stop-color="#8b5cf6" stop-opacity="0.5"/><stop offset="1" stop-color="#8b5cf6" stop-opacity="0"/></radialGradient>
+    <radialGradient id="glowC"><stop offset="0" stop-color="#ec4899" stop-opacity="0.3"/><stop offset="1" stop-color="#ec4899" stop-opacity="0"/></radialGradient>
+    <radialGradient id="tileGlow"><stop offset="0" stop-color="#a78bfa" stop-opacity="0.55"/><stop offset="1" stop-color="#a78bfa" stop-opacity="0"/></radialGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="#ffffff" stroke-opacity="0.045" stroke-width="1"/>
+    </pattern>
+    <g id="drive">
+      <rect x="0" y="6" width="56" height="36" rx="7"/>
+      <rect x="8" y="31" width="26" height="4" rx="2" fill="#000" fill-opacity="0.25"/>
+      <circle cx="46" cy="33" r="3" fill="#34d399"/>
+    </g>
+  </defs>
+
+  <rect width="1280" height="640" fill="url(#bg)"/>
+  <rect width="1280" height="640" fill="url(#grid)"/>
+  <circle cx="220" cy="110" r="420" fill="url(#glowA)"/>
+  <circle cx="1100" cy="560" r="460" fill="url(#glowB)"/>
+  <circle cx="760" cy="30" r="300" fill="url(#glowC)"/>
+
+  <!-- Left: the message -->
+  <g font-family="Segoe UI, -apple-system, BlinkMacSystemFont, Inter, Helvetica, Arial, sans-serif">
+    <text x="72" y="196" font-size="128" font-weight="800" letter-spacing="-4" fill="url(#ink)" textLength="476" lengthAdjust="spacingAndGlyphs">winapfs</text>
+    <text x="76" y="268" font-size="50" font-weight="700" fill="#f1f5f9">Your Mac drive,</text>
+    <text x="76" y="328" font-size="50" font-weight="700" fill="#f1f5f9">right in <tspan fill="url(#ink)">Explorer.</tspan></text>
+    <text x="78" y="378" font-size="27" font-weight="400" fill="#a5b4c8">Plug it in. Open, copy, save. On Windows.</text>
+    <g font-size="23" font-weight="650">
+      <rect x="76" y="414" width="182" height="46" rx="23" fill="#a78bfa" fill-opacity="0.18" stroke="#a78bfa" stroke-opacity="0.6"/>
+      <text x="167" y="445" text-anchor="middle" fill="#ddd6fe">Read + Write</text>
+      <rect x="270" y="414" width="196" height="46" rx="23" fill="#22d3ee" fill-opacity="0.13" stroke="#22d3ee" stroke-opacity="0.55"/>
+      <text x="368" y="445" text-anchor="middle" fill="#a5f3fc">10-sec setup</text>
+      <rect x="478" y="414" width="100" height="46" rx="23" fill="#f472b6" fill-opacity="0.14" stroke="#f472b6" stroke-opacity="0.55"/>
+      <text x="528" y="445" text-anchor="middle" fill="#fbcfe8">Free</text>
+    </g>
+    <text x="78" y="566" font-size="25" font-weight="600" fill="#7c8aa5">github.com/ZYRT3CH/winapfs</text>
+  </g>
+
+  <!-- Right: File Explorer, This PC -->
+  <g font-family="Segoe UI, -apple-system, Helvetica, Arial, sans-serif">
+    <rect x="652" y="86" width="590" height="470" rx="16" fill="#000000" fill-opacity="0.35" transform="translate(8 12)"/>
+    <rect x="652" y="86" width="590" height="470" rx="16" fill="#1c1c21" stroke="url(#frame)" stroke-width="2.5"/>
+    <path d="M668 86h558a16 16 0 0 1 16 16v32H652v-32a16 16 0 0 1 16-16z" fill="#141418"/>
+    <rect x="664" y="95" width="170" height="37" rx="9" fill="#26262d"/>
+    <rect x="680" y="107" width="19" height="13" rx="2" fill="none" stroke="#9cc7ff" stroke-width="2"/>
+    <text x="710" y="119" font-size="15" fill="#e5e7eb">This PC</text>
+    <g font-size="15" fill="#a1a1aa">
+      <text x="1140" y="117">—</text>
+      <rect x="1172" y="106" width="12" height="12" fill="none" stroke="#a1a1aa" stroke-width="1.4"/>
+      <text x="1206" y="118">✕</text>
+    </g>
+    <rect x="652" y="134" width="590" height="1" fill="#2c2c33"/>
+
+    <!-- Sidebar -->
+    <g font-size="15" fill="#d4d4d8">
+      <text x="674" y="172">🏠  Home</text>
+      <text x="674" y="206">⬇  Downloads</text>
+      <rect x="664" y="222" width="150" height="34" rx="7" fill="#2b2b33"/>
+      <rect x="664" y="230" width="3" height="18" rx="1.5" fill="#60a5fa"/>
+      <text x="676" y="245" fill="#ffffff">💻  This PC</text>
+      <text x="690" y="282">Windows (C:)</text>
+      <text x="690" y="316" fill="url(#ink)" font-weight="700">Mac drive (M:)</text>
+    </g>
+    <rect x="826" y="135" width="1" height="420" fill="#2c2c33"/>
+
+    <!-- Drives -->
+    <text x="848" y="174" font-size="16" font-weight="600" fill="#e5e7eb">⌄  Devices and drives</text>
+
+    <use href="#drive" x="860" y="194" fill="url(#driveGray)"/>
+    <text x="932" y="216" font-size="16" fill="#e5e7eb">Windows (C:)</text>
+    <rect x="932" y="228" width="260" height="8" rx="4" fill="#3a3a42"/>
+    <rect x="932" y="228" width="150" height="8" rx="4" fill="#4cc2ff"/>
+    <text x="932" y="258" font-size="14" fill="#9ca3af">412 GB free of 952 GB</text>
+
+    <ellipse cx="1040" cy="330" rx="230" ry="80" fill="url(#tileGlow)"/>
+    <rect x="846" y="282" width="380" height="96" rx="12" fill="#a78bfa" fill-opacity="0.12" stroke="url(#frame)" stroke-width="2.5"/>
+    <use href="#drive" x="860" y="302" fill="url(#ink)"/>
+    <text x="932" y="324" font-size="17" font-weight="700" fill="#ffffff">Mac drive (M:)</text>
+    <rect x="1138" y="294" width="74" height="24" rx="12" fill="#34d399" fill-opacity="0.15" stroke="#34d399" stroke-opacity="0.6"/>
+    <text x="1175" y="311" font-size="13" font-weight="700" text-anchor="middle" fill="#6ee7b7">APFS</text>
+    <rect x="932" y="336" width="260" height="8" rx="4" fill="#3a3a42"/>
+    <rect x="932" y="336" width="215" height="8" rx="4" fill="url(#ink)"/>
+    <text x="932" y="366" font-size="14" fill="#c4b5fd">315 GB free of 1.81 TB</text>
+
+    <!-- Copy finished -->
+    <rect x="846" y="408" width="380" height="122" rx="12" fill="#26262d" stroke="#3a3a44"/>
+    <text x="866" y="440" font-size="15" fill="#e5e7eb">Copying to <tspan font-weight="700" fill="#ffffff">Mac drive (M:)</tspan></text>
+    <text x="866" y="466" font-size="14" fill="#a1a1aa">🎬  Holiday 2024.mov  ·  2.1 GB</text>
+    <rect x="866" y="482" width="340" height="9" rx="4.5" fill="url(#ink)"/>
+    <text x="866" y="516" font-size="14" font-weight="700" fill="#34d399">✓  Done</text>
+  </g>
+</svg>

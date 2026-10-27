@@ -66,7 +66,7 @@ irm https://raw.githubusercontent.com/ZYRT3CH/winapfs/main/install.ps1 | iex
 </table>
 
 <p align="center">
-  <img src="docs/assets/demo.svg" width="780" alt="Terminal: winapfs write on, plug in the Mac drive, it is checked and mounted writable at M:, a video is copied on and verified.">
+  <img src="docs/assets/explorer.svg" width="820" alt="Windows File Explorer, This PC: a Mac drive appears as Mac drive (M:) next to the Windows drives, and a video is copied onto it.">
 </p>
 
 ---
@@ -198,6 +198,10 @@ winapfs help                           everything else
 ```
 
 `auto` means "the Mac drive that is plugged in". You can also name a disk, like `disk3`. Commands that read the disk directly (`info`, `ls`, `get`, `verify`) need an Administrator terminal.
+
+<p align="center">
+  <img src="docs/assets/demo.svg" width="720" alt="Terminal: winapfs write on, plug in the Mac drive, it is checked and mounted writable at M:, a video is copied on and verified.">
+</p>
 
 ## 🔧 How it works
 

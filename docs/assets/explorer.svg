@@ -1,0 +1,145 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 540" width="960" height="540" role="img" aria-label="Windows File Explorer, This PC: a Mac drive appears as drive M: next to the Windows drives, and a video is copied onto it.">
+  <defs>
+    <style>text { white-space: pre; }</style>
+    <linearGradient id="ink" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="0.5" stop-color="#a78bfa"/>
+      <stop offset="1" stop-color="#f472b6"/>
+    </linearGradient>
+    <linearGradient id="frame" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="0.5" stop-color="#a78bfa"/>
+      <stop offset="1" stop-color="#f472b6"/>
+    </linearGradient>
+    <linearGradient id="driveGray" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#d1d5db"/>
+      <stop offset="1" stop-color="#9ca3af"/>
+    </linearGradient>
+    <clipPath id="progress">
+      <rect x="560" y="463" height="8" width="0">
+        <animate attributeName="width" values="0;0;330;330;0" keyTimes="0;0.33;0.70;0.95;1" dur="10s" repeatCount="indefinite"/>
+      </rect>
+    </clipPath>
+    <!-- A drive: grey for Windows drives, the gradient for the Mac drive. -->
+    <g id="drive">
+      <rect x="0" y="6" width="46" height="30" rx="6"/>
+      <rect x="6" y="26" width="22" height="3" rx="1.5" fill="#000" fill-opacity="0.25"/>
+      <circle cx="38" cy="27.5" r="2.5" fill="#34d399"/>
+    </g>
+  </defs>
+
+  <!-- Window -->
+  <rect x="10" y="10" width="940" height="520" rx="14" fill="#1c1c21" stroke="url(#frame)" stroke-width="2"/>
+  <path d="M24 10h912a14 14 0 0 1 14 14v30H10V24a14 14 0 0 1 14-14z" fill="#141418"/>
+  <rect x="22" y="18" width="190" height="36" rx="9" fill="#26262d"/>
+  <rect x="38" y="30" width="18" height="12" rx="2" fill="none" stroke="#9cc7ff" stroke-width="2"/>
+  <rect x="43" y="44" width="8" height="2" fill="#9cc7ff"/>
+  <text x="66" y="41" font-family="Segoe UI, -apple-system, Helvetica, Arial, sans-serif" font-size="14" fill="#e5e7eb">This PC</text>
+  <text x="190" y="41" font-family="Segoe UI, Arial, sans-serif" font-size="13" fill="#8b8b95">✕</text>
+  <text x="228" y="42" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#8b8b95">+</text>
+  <g font-family="Segoe UI, Arial, sans-serif" font-size="15" fill="#a1a1aa">
+    <text x="842" y="38">—</text>
+    <rect x="875" y="27" width="12" height="12" fill="none" stroke="#a1a1aa" stroke-width="1.4"/>
+    <text x="912" y="39">✕</text>
+  </g>
+
+  <!-- Address bar -->
+  <g font-family="Segoe UI, -apple-system, Helvetica, Arial, sans-serif" font-size="14">
+    <text x="30" y="83" fill="#a1a1aa">←    →    ↑    ⟳</text>
+    <rect x="170" y="64" width="470" height="30" rx="7" fill="#26262d"/>
+    <text x="184" y="84" fill="#e5e7eb">🖥  ›  This PC  ›</text>
+    <rect x="652" y="64" width="282" height="30" rx="7" fill="#26262d"/>
+    <text x="668" y="84" fill="#8b8b95">⌕  Search This PC</text>
+  </g>
+  <rect x="10" y="104" width="940" height="1" fill="#2c2c33"/>
+
+  <!-- Sidebar -->
+  <g font-family="Segoe UI, -apple-system, Helvetica, Arial, sans-serif" font-size="14" fill="#d4d4d8">
+    <text x="34" y="138">🏠  Home</text>
+    <text x="34" y="170">🖼  Gallery</text>
+    <text x="34" y="210">🖥  Desktop</text>
+    <text x="34" y="242">⬇  Downloads</text>
+    <text x="34" y="274">📄  Documents</text>
+    <text x="34" y="306">🎵  Music</text>
+    <rect x="22" y="322" width="176" height="1" fill="#2c2c33"/>
+    <rect x="20" y="334" width="180" height="30" rx="6" fill="#2b2b33"/>
+    <rect x="20" y="341" width="3" height="16" rx="1.5" fill="#60a5fa"/>
+    <text x="34" y="354" fill="#ffffff">💻  This PC</text>
+    <text x="52" y="386">Windows (C:)</text>
+    <text x="52" y="418">Data (D:)</text>
+    <g opacity="0">
+      <animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.1;0.14;0.95;1" dur="10s" repeatCount="indefinite"/>
+      <text x="52" y="450" fill="url(#ink)" font-weight="700">Mac drive (M:)</text>
+    </g>
+  </g>
+  <rect x="210" y="105" width="1" height="424" fill="#2c2c33"/>
+
+  <!-- Devices and drives -->
+  <g font-family="Segoe UI, -apple-system, Helvetica, Arial, sans-serif">
+    <text x="236" y="140" font-size="15" font-weight="600" fill="#e5e7eb">⌄  Devices and drives</text>
+
+    <!-- C: -->
+    <use href="#drive" x="246" y="166" fill="url(#driveGray)"/>
+    <text x="306" y="184" font-size="14" fill="#e5e7eb">Windows (C:)</text>
+    <rect x="306" y="194" width="150" height="7" rx="3.5" fill="#3a3a42"/>
+    <rect x="306" y="194" width="86" height="7" rx="3.5" fill="#4cc2ff"/>
+    <text x="306" y="221" font-size="12.5" fill="#9ca3af">412 GB free of 952 GB</text>
+
+    <!-- D: -->
+    <use href="#drive" x="478" y="166" fill="url(#driveGray)"/>
+    <text x="538" y="184" font-size="14" fill="#e5e7eb">Data (D:)</text>
+    <rect x="538" y="194" width="150" height="7" rx="3.5" fill="#3a3a42"/>
+    <rect x="538" y="194" width="58" height="7" rx="3.5" fill="#4cc2ff"/>
+    <text x="538" y="221" font-size="12.5" fill="#9ca3af">2.1 TB free of 3.6 TB</text>
+
+    <!-- M: the Mac drive, appearing when it is plugged in -->
+    <g opacity="0">
+      <animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.1;0.14;0.95;1" dur="10s" repeatCount="indefinite"/>
+      <rect x="704" y="150" width="232" height="86" rx="10" fill="#a78bfa" fill-opacity="0.10" stroke="url(#frame)" stroke-width="2">
+        <animate attributeName="stroke-opacity" values="0;0;1;0.35;1;0.35;0.35" keyTimes="0;0.1;0.14;0.2;0.26;0.32;1" dur="10s" repeatCount="indefinite"/>
+      </rect>
+      <use href="#drive" x="714" y="166" fill="url(#ink)"/>
+      <text x="774" y="184" font-size="14" font-weight="700" fill="#ffffff">Mac drive (M:)</text>
+      <rect x="774" y="194" width="150" height="7" rx="3.5" fill="#3a3a42"/>
+      <rect x="774" y="194" width="124" height="7" rx="3.5" fill="url(#ink)"/>
+      <text x="774" y="221" font-size="12.5" fill="#c4b5fd">315 GB free of 1.81 TB</text>
+      <rect x="866" y="156" width="62" height="20" rx="10" fill="#34d399" fill-opacity="0.15" stroke="#34d399" stroke-opacity="0.6"/>
+      <text x="897" y="170" font-size="11" font-weight="700" text-anchor="middle" fill="#6ee7b7">APFS</text>
+    </g>
+
+    <!-- What winapfs adds, called out -->
+    <g opacity="0">
+      <animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.16;0.2;0.95;1" dur="10s" repeatCount="indefinite"/>
+      <text x="820" y="266" font-size="14" font-weight="600" text-anchor="middle" fill="url(#ink)">↑  your Mac drive, just plugged in</text>
+    </g>
+
+    <!-- Copy dialog -->
+    <g opacity="0">
+      <animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.29;0.32;0.95;1" dur="10s" repeatCount="indefinite"/>
+      <rect x="540" y="372" width="380" height="136" rx="12" fill="#26262d" stroke="#3a3a44"/>
+      <text x="560" y="402" font-size="14" fill="#e5e7eb">Copying 1 item to <tspan font-weight="700" fill="#ffffff">Mac drive (M:)</tspan></text>
+      <text x="560" y="428" font-size="13" fill="#a1a1aa">🎬  Holiday 2024.mov  ·  2.1 GB</text>
+      <rect x="560" y="463" width="330" height="8" rx="4" fill="#3a3a42"/>
+      <rect x="560" y="463" width="330" height="8" rx="4" fill="url(#ink)" clip-path="url(#progress)"/>
+      <g opacity="0">
+        <animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.7;0.72;0.95;1" dur="10s" repeatCount="indefinite"/>
+        <text x="560" y="495" font-size="13" font-weight="700" fill="#34d399">✓  Done. It is on your Mac drive.</text>
+      </g>
+    </g>
+
+    <!-- Files you already had on the Mac drive, shown while copying -->
+    <g opacity="0" font-size="13" fill="#d4d4d8">
+      <animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.2;0.24;0.95;1" dur="10s" repeatCount="indefinite"/>
+      <text x="236" y="300" font-size="15" font-weight="600" fill="#e5e7eb">⌄  On your Mac drive</text>
+      <text x="246" y="332">📁  Photos</text>
+      <text x="246" y="360">📁  Projects</text>
+      <text x="246" y="388">📁  Music</text>
+      <text x="246" y="416">🎬  Wedding film.mov</text>
+      <text x="246" y="444">📄  Invoice 2025.pdf</text>
+      <g opacity="0">
+        <animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.7;0.72;0.95;1" dur="10s" repeatCount="indefinite"/>
+        <text x="246" y="472" fill="#f0abfc" font-weight="600">🎬  Holiday 2024.mov   new</text>
+      </g>
+    </g>
+  </g>
+</svg>
