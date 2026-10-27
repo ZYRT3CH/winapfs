@@ -21,6 +21,8 @@ const CHECKPOINT_MAP_LAST: u32 = 0x1;
 /// Cached B-tree nodes (32 MiB at 4 KiB blocks). Safe while read-only:
 /// APFS never rewrites a block in place, so a cached node cannot go stale.
 const NODE_CACHE_CAP: usize = 8192;
+/// Cached objects other than B-tree nodes.
+const OBJECT_CACHE_CAP: usize = 1024;
 
 pub const NX_INCOMPAT_VERSION1: u64 = 0x1;
 pub const NX_INCOMPAT_FUSION: u64 = 0x100;
@@ -36,12 +38,14 @@ pub struct Reader {
     pub block_size: u32,
     pub block_count: u64,
     nodes: Mutex<HashMap<u64, Arc<Node>>>,
+    /// Checked objects (volume superblocks, object maps) by address.
+    objects: Mutex<HashMap<u64, Vec<u8>>>,
     node_reads: AtomicU64,
 }
 
 impl Reader {
     fn new(dev: Box<dyn BlockDevice>, block_size: u32, block_count: u64) -> Self {
-        Self { dev, block_size, block_count, nodes: Mutex::new(HashMap::new()), node_reads: AtomicU64::new(0) }
+        Self { dev, block_size, block_count, nodes: Mutex::new(HashMap::new()), objects: Mutex::new(HashMap::new()), node_reads: AtomicU64::new(0) }
     }
 
     pub fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<()> {
@@ -57,12 +61,21 @@ impl Reader {
         Ok(b)
     }
 
-    /// Reads a block and verifies its object checksum.
+    /// Reads a block and verifies its object checksum. Cached, like nodes:
+    /// APFS never rewrites a block in place.
     pub fn read_object(&self, paddr: u64) -> Result<Vec<u8>> {
+        if let Some(b) = self.objects.lock().unwrap().get(&paddr) {
+            return Ok(b.clone());
+        }
         let b = self.read_block(paddr)?;
         if !checksum::verify(&b) {
             return Err(corrupt(format!("checksum mismatch in object at block {paddr:#x}")));
         }
+        let mut cache = self.objects.lock().unwrap();
+        if cache.len() >= OBJECT_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(paddr, b.clone());
         Ok(b)
     }
 }
@@ -416,10 +429,13 @@ fn latest_checkpoint(r: &Reader, sb0: &NxSuperblock) -> Result<(NxSuperblock, Ve
         return Err(unsupported("checkpoint descriptor area stored as a B-tree"));
     }
     let ring = sb0.xp_desc_blocks as u64;
+    let bs = r.block_size as usize;
+    // One read for the whole area: on a USB disk each request costs a round trip.
+    let mut area = vec![0u8; ring as usize * bs];
+    r.read_at(sb0.xp_desc_base * bs as u64, &mut area)?;
     let mut candidates = Vec::new();
-    for i in 0..ring {
-        let b = r.read_block(sb0.xp_desc_base + i)?;
-        let hdr = ObjHeader::parse(&b)?;
+    for b in area.chunks(bs) {
+        let hdr = ObjHeader::parse(b)?;
         if hdr.kind() == OBJECT_TYPE_NX_SUPERBLOCK && u32_at(&b, 32)? == NX_MAGIC && checksum::verify(&b) {
             candidates.push(NxSuperblock::parse(&b)?);
         }

@@ -866,6 +866,7 @@ fn cmd_mount(src: Option<&str>, mount_point: &str, vol: usize, part: Option<u32>
                 _ => apfs::write::Session::open_real_disk(Path::new(&path), base, uuid, vol)?,
             };
             let b: &'static backends::ApfsRwBackend = Box::leak(Box::new(backends::ApfsRwBackend::from_session(s)?));
+            b.start_committer();
             rw = Some(b);
             (b, format!("volume {vol} \"{}\" from {location}", mountfs::Backend::label(b)))
         }

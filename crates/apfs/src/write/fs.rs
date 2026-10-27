@@ -11,7 +11,7 @@ const APFS_TYPE_INODE: u64 = 3;
 pub const APFS_TYPE_XATTR: u64 = 4;
 const APFS_TYPE_DSTREAM_ID: u64 = 6;
 const APFS_TYPE_FILE_EXTENT: u64 = 8;
-const APFS_TYPE_DIR_REC: u64 = 9;
+pub const APFS_TYPE_DIR_REC: u64 = 9;
 
 pub const DT_REG: u16 = 8;
 pub const DT_DIR: u16 = 4;
@@ -56,6 +56,11 @@ pub fn key_type(key: &[u8]) -> u64 {
 /// A search bound below every record of object `id`.
 pub fn key_bound(id: u64) -> Vec<u8> {
     hdr(id, 0).to_vec()
+}
+
+/// A search bound below every record of object `id` with type `kind` or later.
+pub fn key_bound_type(id: u64, kind: u64) -> Vec<u8> {
+    hdr(id, kind).to_vec()
 }
 
 pub fn inode_key(id: u64) -> Vec<u8> {

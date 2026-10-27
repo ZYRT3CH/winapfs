@@ -2,6 +2,7 @@
 //! tree for testing the Windows side without a Mac drive.
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use apfs::write::{NewKind, Session, Times};
 use apfs::{Container, Extent, FileKind, Inode, NameRule, Volume};
@@ -64,22 +65,64 @@ pub struct ApfsRwBackend {
     total: u64,
     /// The last compressed file read, decompressed: (inode, transaction, bytes).
     decompressed: Mutex<Option<(u64, u64, Arc<Vec<u8>>)>>,
+    /// When the last change came in, and when the oldest uncommitted one did.
+    activity: Mutex<(Instant, Option<Instant>)>,
 }
 
+/// Changes are committed once the volume has been quiet this long...
+const COMMIT_AFTER_QUIET: Duration = Duration::from_millis(1000);
+/// ...or once the oldest uncommitted change is this old.
+const COMMIT_AT_MOST_EVERY: Duration = Duration::from_secs(5);
+
 impl ApfsRwBackend {
-    /// Serves a session already open: on an image, a real disk, or an overlay.
-    pub fn from_session(s: Session) -> apfs::Result<Self> {
+    /// Serves a session already open: on an image, a real disk, or an
+    /// overlay. Changes collect in one transaction and are committed by
+    /// [`ApfsRwBackend::start_committer`], on flush and at unmount.
+    pub fn from_session(mut s: Session) -> apfs::Result<Self> {
+        s.set_batch(true);
         let v = s.volume()?;
         let block_size = s.container().block_size() as u64;
         let (label, rule, serial, created) =
             (v.sb.name.clone(), v.name_rule(), u32::from_le_bytes(v.sb.vol_uuid[..4].try_into().unwrap()), v.sb.last_mod_time);
         drop(v);
         let total = s.container().sb.block_count * block_size;
-        Ok(Self { s: Mutex::new(s), label, rule, serial, created, block_size, total, decompressed: Mutex::new(None) })
+        Ok(Self {
+            s: Mutex::new(s),
+            label,
+            rule,
+            serial,
+            created,
+            block_size,
+            total,
+            decompressed: Mutex::new(None),
+            activity: Mutex::new((Instant::now(), None)),
+        })
     }
 
     pub fn session(&self) -> std::sync::MutexGuard<'_, Session> {
         self.s.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Records a change: the committer waits for a quiet moment.
+    fn changed(&self) {
+        let now = Instant::now();
+        let mut a = self.activity.lock().unwrap();
+        a.0 = now;
+        a.1.get_or_insert(now);
+    }
+
+    /// Starts the thread that commits collected changes.
+    pub fn start_committer(&'static self) {
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_millis(250));
+            let due = {
+                let a = self.activity.lock().unwrap();
+                a.1.is_some_and(|oldest| a.0.elapsed() >= COMMIT_AFTER_QUIET || oldest.elapsed() >= COMMIT_AT_MOST_EVERY)
+            };
+            if due {
+                let _ = Backend::flush(self);
+            }
+        });
     }
 }
 
@@ -115,25 +158,10 @@ impl Backend for ApfsRwBackend {
     }
 
     fn list(&self, dir: u64) -> Result<Vec<(String, Meta)>, NTSTATUS> {
-        let s = self.session();
+        let mut s = self.session();
+        let entries = s.list(dir).map_err(status)?;
         let v = s.volume().map_err(status)?;
-        let entries = v.read_dir(dir).map_err(status)?;
-        let mut out = Vec::with_capacity(entries.len());
-        for e in entries {
-            match v.inode(e.file_id) {
-                Ok(inode) => {
-                    let mut m = meta_of(&v, &inode);
-                    if let Some(size) = s.pending_size(m.id) {
-                        m.size = size;
-                    }
-                    out.push((e.name, m));
-                }
-                Err(err) => {
-                    status(err); // logged; the entry is left out rather than failing the folder
-                }
-            }
-        }
-        Ok(out)
+        Ok(entries.into_iter().map(|(name, inode)| (name, meta_of(&v, &inode))).collect())
     }
 
     fn name_key(&self, name: &str) -> String {
@@ -191,25 +219,33 @@ impl Backend for ApfsRwBackend {
     fn create(&self, dir: u64, name: &str, is_dir: bool) -> Result<Meta, NTSTATUS> {
         let kind = if is_dir { NewKind::Folder } else { NewKind::File };
         let id = self.session().create(dir, name, kind).map_err(status)?;
+        self.changed();
         self.stat(id)
     }
 
     fn write(&self, id: u64, off: u64, data: &[u8]) -> Result<u64, NTSTATUS> {
         let mut s = self.session();
         s.write(id, off, data).map_err(status)?;
+        self.changed();
         Ok(s.pending_size(id).unwrap_or(off + data.len() as u64))
     }
 
     fn set_size(&self, id: u64, size: u64) -> Result<(), NTSTATUS> {
-        self.session().set_size(id, size).map_err(status)
+        self.session().set_size(id, size).map_err(status)?;
+        self.changed();
+        Ok(())
     }
 
     fn remove(&self, dir: u64, name: &str) -> Result<(), NTSTATUS> {
-        self.session().remove(dir, name).map_err(status)
+        self.session().remove(dir, name).map_err(status)?;
+        self.changed();
+        Ok(())
     }
 
     fn rename(&self, sdir: u64, sname: &str, ddir: u64, dname: &str, replace: bool) -> Result<(), NTSTATUS> {
-        self.session().rename(sdir, sname, ddir, dname, replace).map_err(status)
+        self.session().rename(sdir, sname, ddir, dname, replace).map_err(status)?;
+        self.changed();
+        Ok(())
     }
 
     fn set_info(&self, id: u64, t: SetTimes, hidden: Option<bool>) -> Result<(), NTSTATUS> {
@@ -221,11 +257,23 @@ impl Backend for ApfsRwBackend {
         if let Some(h) = hidden {
             s.set_hidden(id, h).map_err(status)?;
         }
+        self.changed();
         Ok(())
     }
 
+    /// Commits everything collected so far.
     fn flush(&self) -> Result<(), NTSTATUS> {
-        self.session().flush().map_err(status)
+        let mut s = self.session();
+        // Taken under the session lock, so changes made meanwhile wait for the next commit.
+        self.activity.lock().unwrap().1 = None;
+        s.flush().map_err(status)
+    }
+
+    /// A file written through this mount was closed: the committer saves it
+    /// at the next quiet moment.
+    fn file_closed(&self) -> Result<(), NTSTATUS> {
+        self.changed();
+        Ok(())
     }
 }
 

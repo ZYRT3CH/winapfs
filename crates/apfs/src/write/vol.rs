@@ -42,6 +42,8 @@ pub struct Times {
 const XATTR_DATA_STREAM: u16 = 0x1;
 const APFS_TYPE_SIBLING_LINK: u64 = 5;
 pub(super) const ROOT_DIR_INO: u64 = 2;
+/// Most file data queued before it is written out (8 MiB).
+const PENDING_IO_MAX: usize = 8 << 20;
 
 /// Reads a volume's file-system tree nodes through its object map.
 pub(super) struct VolReader<'a, 'c>(pub &'a Volume<'c>);
@@ -82,6 +84,8 @@ pub(super) struct VolState {
     pub data_alloced: u64,
     pub data_freed: u64,
     files: HashMap<u64, FileState>,
+    /// File data waiting to be written: (first block, bytes), contiguous.
+    pending_io: Option<(u64, Vec<u8>)>,
 }
 
 impl VolState {
@@ -90,7 +94,7 @@ impl VolState {
             return Err(unsupported("writing to volumes that have snapshots"));
         }
         let tree = Tree::open(&VolReader(v), v.sb.root_tree_oid, fs::key_cmp)?;
-        Ok(Self { tree, extref: None, apsb: v.sb.raw.clone(), data_alloced: 0, data_freed: 0, files: HashMap::new() })
+        Ok(Self { tree, extref: None, apsb: v.sb.raw.clone(), data_alloced: 0, data_freed: 0, files: HashMap::new(), pending_io: None })
     }
 
     pub fn changed(&self) -> bool {
@@ -181,6 +185,23 @@ impl<'a, 'c> VolEdit<'a, 'c> {
 
     /// The directory entry for `name` in `dir`, matched as the volume
     /// compares names: (key, value).
+    /// The entries of folder `dir` as they stand: (name, inode).
+    pub fn list(&mut self, dir: u64) -> Result<Vec<(String, Inode)>> {
+        let mut out = Vec::new();
+        let lo = fs::key_bound_type(dir, fs::APFS_TYPE_DIR_REC);
+        let hi = fs::key_bound_type(dir, fs::APFS_TYPE_DIR_REC + 1);
+        for (k, v) in self.range(&lo, &hi)? {
+            let Some(v) = v else { continue };
+            let id = u64_at(&v, 0)?;
+            match self.inode(id) {
+                Ok(inode) => out.push((fs::drec_name(&k), inode)),
+                Err(Error::NotFound(_)) => {} // left out rather than failing the folder
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
+    }
+
     /// The inode number of `name` in folder `dir`, if it is there.
     pub fn lookup(&mut self, dir: u64, name: &str) -> Result<Option<u64>> {
         match self.find_entry(dir, name)? {
@@ -365,6 +386,56 @@ impl<'a, 'c> VolEdit<'a, 'c> {
         Ok(self.st.files.get_mut(&id).unwrap())
     }
 
+    /// Queues file data for block `phys`: writes that continue the queued
+    /// run join it (up to [`PENDING_IO_MAX`]), rewrites inside it update it,
+    /// anything else writes the queue out first. Disks take few large writes
+    /// far faster than many small ones.
+    fn stage(&mut self, dev: &dyn WriteDevice, phys: u64, data: Vec<u8>) -> Result<()> {
+        let bs = self.bs();
+        let blocks = data.len() as u64 / bs;
+        if let Some((start, buf)) = &mut self.st.pending_io {
+            let end = *start + buf.len() as u64 / bs;
+            if phys >= *start && phys + blocks <= end {
+                let at = ((phys - *start) * bs) as usize;
+                buf[at..at + data.len()].copy_from_slice(&data);
+                return Ok(());
+            }
+            if phys == end && buf.len() + data.len() <= PENDING_IO_MAX {
+                buf.extend_from_slice(&data);
+                return Ok(());
+            }
+        }
+        self.write_pending_io(dev)?;
+        if data.len() >= PENDING_IO_MAX {
+            return dev.write_at(phys * bs, &data);
+        }
+        self.st.pending_io = Some((phys, data));
+        Ok(())
+    }
+
+    /// Writes out queued file data.
+    pub fn write_pending_io(&mut self, dev: &dyn WriteDevice) -> Result<()> {
+        if let Some((start, buf)) = self.st.pending_io.take() {
+            dev.write_at(start * self.bs(), &buf)?;
+        }
+        Ok(())
+    }
+
+    /// Reads whole blocks from `phys`, seeing queued file data.
+    fn read_fresh(&self, phys: u64, out: &mut [u8]) -> Result<()> {
+        let bs = self.bs();
+        self.v.container().r.read_at(phys * bs, out)?;
+        if let Some((start, buf)) = &self.st.pending_io {
+            let (a, b) = (phys * bs, phys * bs + out.len() as u64);
+            let (qa, qb) = (start * bs, start * bs + buf.len() as u64);
+            let (s, e) = (a.max(qa), b.min(qb));
+            if s < e {
+                out[(s - a) as usize..(e - a) as usize].copy_from_slice(&buf[(s - qa) as usize..(e - qa) as usize]);
+            }
+        }
+        Ok(())
+    }
+
     /// Reads a file being written; `None` if it is not.
     pub fn read_pending(&self, id: u64, off: u64, buf: &mut [u8]) -> Result<Option<usize>> {
         let Some(f) = self.st.files.get(&id) else { return Ok(None) };
@@ -373,7 +444,6 @@ impl<'a, 'c> VolEdit<'a, 'c> {
         }
         let len = (buf.len() as u64).min(f.size - off) as usize;
         let bs = self.bs();
-        let c = self.v.container();
         let buf = &mut buf[..len];
         buf.fill(0);
         let end = off + len as u64;
@@ -384,7 +454,7 @@ impl<'a, 'c> VolEdit<'a, 'c> {
                 // Whole blocks only: raw disks refuse unaligned reads.
                 let (first, last) = ((s - rs) / bs, (e - rs).div_ceil(bs));
                 let mut tmp = vec![0u8; ((last - first) * bs) as usize];
-                c.r.read_at((r.phys + first) * bs, &mut tmp)?;
+                self.read_fresh(r.phys + first, &mut tmp)?;
                 let skip = (s - rs - first * bs) as usize;
                 buf[(s - off) as usize..(e - off) as usize].copy_from_slice(&tmp[skip..skip + (e - s) as usize]);
             }
@@ -490,16 +560,16 @@ impl<'a, 'c> VolEdit<'a, 'c> {
                 if off > es || end < ee {
                     let mut old = vec![0u8; bs as usize];
                     if fresh_run {
-                        c.r.read_at((phys + edge - lb) * bs, &mut old)?;
+                        self.read_fresh(phys + edge - lb, &mut old)?;
                     } else if let Some(r) = self.find_run(id, edge)? {
-                        c.r.read_at((r.phys + edge - r.lblock) * bs, &mut old)?;
+                        self.read_fresh(r.phys + edge - r.lblock, &mut old)?;
                     }
                     buf[(es - bstart) as usize..(ee - bstart) as usize].copy_from_slice(&old);
                 }
             }
             let (s, e) = (off.max(bstart), end.min(bend));
             buf[(s - bstart) as usize..(e - bstart) as usize].copy_from_slice(&data[(s - off) as usize..(e - off) as usize]);
-            dev.write_at(phys * bs, &buf)?;
+            self.stage(dev, phys, buf)?;
             if !fresh_run {
                 self.map_run(t, id, Run { lblock: lb, phys, blocks: n, fresh: true })?;
             }
@@ -626,7 +696,8 @@ impl<'a, 'c> VolEdit<'a, 'c> {
     }
 
     /// Rewrites the records of every file whose data changed.
-    pub fn flush_files(&mut self) -> Result<()> {
+    pub fn flush_files(&mut self, dev: &dyn WriteDevice) -> Result<()> {
+        self.write_pending_io(dev)?;
         let ids: Vec<u64> = self.st.files.keys().copied().collect();
         for id in ids {
             self.flush_file(id)?;

@@ -16,6 +16,7 @@ mod vol;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::bytes::u64_at;
 use crate::checksum;
@@ -142,9 +143,13 @@ impl Writer {
     /// Starts a transaction. Blocks that earlier transactions freed become
     /// reusable now.
     pub fn begin(&self) -> Result<Txn> {
+        let start = Instant::now();
         let xid = self.c.sb.next_xid;
         let mut space = Space::load(&self.c, xid)?;
         space.release_queued(&self.c)?;
+        if start.elapsed().as_secs_f64() > 0.5 || std::env::var_os("WINAPFS_TRACE").is_some() {
+            eprintln!("winapfs: starting transaction {xid} took {:.2} s", start.elapsed().as_secs_f64());
+        }
         Ok(Txn { xid, space, writes: Vec::new(), nx_omap_oid: None, next_oid: self.c.sb.next_oid })
     }
 
@@ -187,7 +192,7 @@ impl Writer {
         if t.nx_omap_oid.is_some() {
             return Err(unsupported("changing two volumes in one transaction"));
         }
-        VolEdit { v, st: &mut st }.flush_files()?;
+        VolEdit { v, st: &mut st }.flush_files(&*self.dev)?;
         let VolState { tree, extref, mut apsb, data_alloced, data_freed, .. } = st;
         let (mut alloced, mut freed) = (data_alloced, data_freed);
         if tree.changed() {
@@ -257,6 +262,7 @@ impl Writer {
     /// Commits a transaction: writes its blocks, then a new checkpoint.
     /// Returns the transaction id.
     pub fn commit(&mut self, t: Txn) -> Result<u64> {
+        let t_start = Instant::now();
         let Txn { xid, space, mut writes, nx_omap_oid, next_oid } = t;
         let mut next_oid = next_oid;
         let (objects, dropped) = space.finish(&mut writes, &mut next_oid)?;
@@ -357,22 +363,52 @@ impl Writer {
 
         // Ordering is what makes this crash-safe: the new superblock is
         // written only after everything it points to is durable.
-        for (paddr, block) in writes.iter().chain(&eph_writes) {
-            if *paddr == 0 || *paddr >= sb.block_count {
-                return Err(corrupt(format!("refusing to write outside the container: block {paddr:#x}")));
+        let t_write = Instant::now();
+        let mut all: Vec<(u64, Vec<u8>)> = writes.into_iter().chain(eph_writes).collect();
+        all.sort_by_key(|w| w.0);
+        // Neighbouring blocks go out as one write: each request is a round trip.
+        let mut i = 0;
+        while i < all.len() {
+            let start = all[i].0;
+            if start == 0 || start >= sb.block_count {
+                return Err(corrupt(format!("refusing to write outside the container: block {start:#x}")));
             }
-            self.dev.write_at(paddr * bs, block)?;
+            let mut buf = std::mem::take(&mut all[i].1);
+            i += 1;
+            while i < all.len() && all[i].0 == start + buf.len() as u64 / bs && buf.len() < 8 << 20 {
+                if all[i].0 >= sb.block_count {
+                    return Err(corrupt(format!("refusing to write outside the container: block {:#x}", all[i].0)));
+                }
+                buf.extend_from_slice(&all[i].1);
+                i += 1;
+            }
+            self.dev.write_at(start * bs, &buf)?;
         }
         self.dev.write_at(cpm_paddr * bs, &cpm)?;
+        let t_flush = Instant::now();
         self.dev.flush()?;
+        let flush1 = t_flush.elapsed();
         self.dev.write_at((desc_base + sb_pos) * bs, &nsb)?;
         self.dev.flush()?;
         self.dev.write_at(0, &nsb)?;
         self.dev.flush()?;
+        let t_reload = Instant::now();
 
         self.reload()?;
         if self.c.xid() != xid {
             return Err(corrupt(format!("after committing xid {xid} the newest checkpoint is {}", self.c.xid())));
+        }
+        let total = t_start.elapsed();
+        if total.as_secs_f64() > 1.0 || std::env::var_os("WINAPFS_TRACE").is_some() {
+            eprintln!(
+                "winapfs: commit {xid} took {:.2} s: prepare {:.2}, write {:.2}, flushes {:.2} (first {:.2}), reload {:.2}",
+                total.as_secs_f64(),
+                (t_write - t_start).as_secs_f64(),
+                (t_flush - t_write).as_secs_f64(),
+                (t_reload - t_flush).as_secs_f64(),
+                flush1.as_secs_f64(),
+                t_reload.elapsed().as_secs_f64()
+            );
         }
         Ok(xid)
     }
@@ -487,6 +523,28 @@ impl Session {
     /// previous checkpoint uses has been overwritten.
     pub fn set_batch(&mut self, batch: bool) {
         self.batch = batch;
+    }
+
+    /// The entries of folder `dir`, seeing changes not yet committed:
+    /// (name, inode), with the sizes of files being written.
+    pub fn list(&mut self, dir: u64) -> Result<Vec<(String, Inode)>> {
+        if self.open.is_none() {
+            let v = self.volume()?;
+            return v.read_dir(dir)?.into_iter().map(|e| Ok((e.name, v.inode(e.file_id)?))).collect();
+        }
+        let mut entries = self.edit(|e, _, _| e.list(dir))?;
+        for (_, inode) in &mut entries {
+            if let Some(size) = self.pending_size(inode.id) {
+                let alloced_size = inode.dstream.map_or(0, |d| d.alloced_size);
+                inode.dstream = Some(crate::fs::Dstream { size, alloced_size });
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Whether a transaction is open (changes not yet committed, or none yet).
+    pub fn in_transaction(&self) -> bool {
+        self.open.is_some()
     }
 
     /// The inode number at `path`, seeing changes not yet committed.

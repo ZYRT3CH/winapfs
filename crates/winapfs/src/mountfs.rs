@@ -99,6 +99,10 @@ pub trait Backend: Send + Sync {
     fn flush(&self) -> Result<(), NTSTATUS> {
         Ok(())
     }
+    /// A file written through the mount was closed.
+    fn file_closed(&self) -> Result<(), NTSTATUS> {
+        self.flush()
+    }
 }
 
 struct Child {
@@ -593,7 +597,7 @@ unsafe extern "system" fn close(fs: *mut FileSystem, file_context: *mut c_void) 
     let me = this(fs);
     me.drop_handle(&h);
     if h.wrote.load(Ordering::SeqCst) && !h.deleted.load(Ordering::SeqCst) {
-        if let Err(s) = me.backend.flush() {
+        if let Err(s) = me.backend.file_closed() {
             eprintln!("winapfs: could not save changes ({s:#x})");
         }
         me.invalidate(&[h.parent]);
