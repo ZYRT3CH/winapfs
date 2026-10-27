@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/ZYRT3CH/winapfs/releases/latest"><img src="https://img.shields.io/badge/download-winapfs.exe-a78bfa?style=for-the-badge" alt="Download winapfs.exe"></a>
+  <a href="https://github.com/ZYRT3CH/winapfs/releases/latest/download/winapfs.exe"><img src="https://img.shields.io/badge/download-winapfs.exe-a78bfa?style=for-the-badge" alt="Download winapfs.exe"></a>
   <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-22d3ee?style=for-the-badge" alt="Windows 10 and 11">
   <img src="https://img.shields.io/badge/APFS-read%20%2B%20write-f472b6?style=for-the-badge" alt="APFS read and write">
   <img src="https://img.shields.io/badge/license-MIT%20%7C%20Apache--2.0-34d399?style=for-the-badge" alt="MIT or Apache-2.0">
@@ -64,21 +64,35 @@
 
 ## 🚀 Set it up in 2 minutes
 
-You need **Windows 10 or 11, 64-bit**.
+You need **Windows 10 or 11, 64-bit**. Pick whichever way you like:
 
-**1. Download** **`winapfs.exe`** from the [latest release](https://github.com/ZYRT3CH/winapfs/releases/latest).
+### ⚡ One command (easiest)
+
+Open **Terminal** or **PowerShell** from the Start menu, paste this, and press **Enter**:
+
+```powershell
+irm https://raw.githubusercontent.com/ZYRT3CH/winapfs/main/install.ps1 | iex
+```
+
+It downloads the latest `winapfs.exe` from this page's official release, checks it against its published checksum, and sets everything up. Say **yes** if it offers to install WinFsp (a free helper that lets winapfs show up as a drive), and click **Yes** when Windows asks for permission. Curious what it does first? [Read the script](install.ps1): it is short.
+
+### 🖱️ Download and double-click
+
+**1.** [**Download winapfs.exe**](https://github.com/ZYRT3CH/winapfs/releases/latest/download/winapfs.exe) (the latest version, straight from GitHub).
 
 **2. Double-click `winapfs.exe`.** A window opens and does the setup for you:
 
-- If your PC does not have **WinFsp** yet, it asks to install it. WinFsp is a free helper that lets winapfs show up as a drive. Press **Enter** to say yes.
+- If your PC does not have **WinFsp** yet, it asks to install it. Press **Enter** to say yes.
 - Windows asks *"Do you want to allow this app to make changes to your device?"* Click **Yes**. (Twice, if WinFsp is being installed: once for WinFsp, once for winapfs.)
 - When the window says **Done**, press **Enter** to close it.
 
-> **Windows may warn you first.** You might see *"Windows protected your PC"*. That happens with new programs that are not yet widely known. Click **More info**, then **Run anyway**.
+> **Windows may warn you first.** You might see *"Windows protected your PC"*. That happens with new programs that are not yet widely known. Click **More info**, then **Run anyway**. (The one-command way does not get this warning.)
 
-**3. Plug in your Mac drive.** After a few seconds it appears in **File Explorer**, usually as **M:**. 🎉
+### Then: plug in your Mac drive
 
-That's it. From now on this happens by itself.
+After a few seconds it appears in **File Explorer**, usually as **M:**. 🎉 That's it. From now on this happens by itself.
+
+<sub>Every release also has a `winapfs.exe.sha256` file to check your download, and all releases are listed [here](https://github.com/ZYRT3CH/winapfs/releases).</sub>
 
 ---
 

@@ -2,6 +2,16 @@
 
 ### How to install
 
+**One command:** open Terminal or PowerShell and paste:
+
+```powershell
+irm https://raw.githubusercontent.com/ZYRT3CH/winapfs/main/install.ps1 | iex
+```
+
+It downloads `winapfs.exe` from this release, checks its checksum and sets everything up.
+
+**Or by hand:**
+
 1. Download **`winapfs.exe`** below.
 2. Double-click it. It installs WinFsp if needed, then asks Windows for permission. Click **Yes**.
 3. Plug in your Mac drive. After a few seconds it appears in File Explorer, usually as **M:**.
