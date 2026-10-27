@@ -13,7 +13,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use crate::btree::{self, BTreeInfo, NodeSource};
-use crate::btree_write::{build, NodeBuild};
+use crate::btree_write::{build, Entry, NodeBuild};
 use crate::bytes::{u32_at, u64_at};
 use crate::checksum;
 use crate::error::{corrupt, unsupported, Error, Result};
@@ -22,6 +22,9 @@ use crate::spaceman::{Spaceman, SD_MAIN, SD_TIER2, SFQ_IP, SFQ_MAIN};
 use crate::write::{put_u32, put_u64, seal, set_xid};
 
 const NO_INDEX: u16 = 0xffff;
+/// A free stretch this long (8 MiB at 4 KiB blocks) is worth seeking out
+/// for file data rather than filling smaller gaps.
+const BIG_RUN: u64 = 2048;
 
 /// A free-queue entry: `count` blocks from `paddr`, freed in transaction `xid`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -29,6 +32,14 @@ pub struct FqEntry {
     pub xid: u64,
     pub paddr: u64,
     pub count: u64,
+}
+
+/// An ephemeral object for the next checkpoint.
+pub struct EphObject {
+    pub oid: u64,
+    pub obj_type: u32,
+    pub subtype: u32,
+    pub data: Vec<u8>,
 }
 
 struct Cib {
@@ -54,6 +65,8 @@ pub struct Space {
     fq_old_nodes: Vec<u64>,
     /// Chunk where the last run was found; earlier ones were full.
     run_hint: usize,
+    /// Chunk where the last big run was found; earlier ones have none.
+    big_hint: usize,
 }
 
 impl Space {
@@ -131,6 +144,7 @@ impl Space {
             fq_roots,
             fq_old_nodes: fq_old_nodes.into_inner(),
             run_hint: 0,
+            big_hint: 0,
         })
     }
 
@@ -208,6 +222,14 @@ impl Space {
     /// run, cut at `max` or at the end of its chunk. Returns (first block,
     /// count).
     pub fn alloc_run(&mut self, c: &Container, max: u64) -> Result<(u64, u64)> {
+        // File data: look for a free stretch big enough not to fragment the
+        // file first, and fill small gaps only when there is none.
+        let min_run = max.min(BIG_RUN);
+        if min_run >= 16 {
+            if let Some(run) = self.find_big_run(c, min_run, max)? {
+                return Ok(run);
+            }
+        }
         let bpc = self.sm.blocks_per_chunk as u64;
         let used = |bm: &[u8], i: usize| bm[i / 8] >> (i % 8) & 1 == 1;
         for ch in self.run_hint..self.chunk_count() {
@@ -233,6 +255,47 @@ impl Space {
             return Ok((ch as u64 * bpc + i as u64, (j - i) as u64));
         }
         Err(Error::NoSpace("the container is full".into()))
+    }
+
+    /// The first free run of at least `min_run` blocks (in a chunk with that
+    /// much free), taking up to `max` of it.
+    fn find_big_run(&mut self, c: &Container, min_run: u64, max: u64) -> Result<Option<(u64, u64)>> {
+        let bpc = self.sm.blocks_per_chunk as u64;
+        for ch in self.big_hint..self.chunk_count() {
+            if (self.chunk_free(ch) as u64) < min_run {
+                continue;
+            }
+            let blocks = self.chunk_blocks(ch) as usize;
+            let bm = self.bitmap(c, ch)?;
+            let used = |i: usize| bm[i / 8] >> (i % 8) & 1 == 1;
+            let mut found = None;
+            let mut i = 0;
+            while i < blocks {
+                if used(i) {
+                    i = if i % 8 == 0 && bm[i / 8] == 0xff { i + 8 } else { i + 1 };
+                    continue;
+                }
+                let start = i;
+                while i < blocks && ((i - start) as u64) < max && !used(i) {
+                    let whole_byte = i % 8 == 0 && i + 8 <= blocks && bm[i / 8] == 0 && ((i + 8 - start) as u64) <= max;
+                    i += if whole_byte { 8 } else { 1 };
+                }
+                if (i - start) as u64 >= min_run {
+                    found = Some((start, i - start));
+                    break;
+                }
+            }
+            if let Some((start, len)) = found {
+                let bm = self.bitmaps.get_mut(&ch).unwrap();
+                for j in start..start + len {
+                    bm[j / 8] |= 1 << (j % 8);
+                }
+                self.add_chunk_free(ch, -(len as i64));
+                self.big_hint = ch;
+                return Ok(Some((ch as u64 * bpc + start as u64, len as u64)));
+            }
+        }
+        Ok(None)
     }
 
     /// Queues a main-device block for freeing.
@@ -288,9 +351,10 @@ impl Space {
     }
 
     /// Writes the changed bitmaps, CIBs and internal-pool bitmap (appending
-    /// them to `writes`) and returns the new ephemeral objects: the space
-    /// manager and the free-queue trees, as (oid, bytes).
-    pub fn finish(mut self, writes: &mut Vec<(u64, Vec<u8>)>) -> Result<(Vec<(u64, Vec<u8>)>, Vec<u64>)> {
+    /// them to `writes`) and returns the new ephemeral objects (the space
+    /// manager and the free-queue trees' nodes, which may take new ids from
+    /// `next_oid`) and the ids of ephemeral objects no longer used.
+    pub fn finish(mut self, writes: &mut Vec<(u64, Vec<u8>)>, next_oid: &mut u64) -> Result<(Vec<EphObject>, Vec<u64>)> {
         let xid = self.xid;
         for ch in std::mem::take(&mut self.dirty_chunks) {
             let new = self.ip_alloc()?;
@@ -335,13 +399,21 @@ impl Space {
         }
         set_xid(&mut self.sm_raw, xid);
         seal(&mut self.sm_raw);
-        let mut out = vec![(self.sm.hdr.oid, self.sm_raw.clone())];
+        let mut out = vec![EphObject {
+            oid: self.sm.hdr.oid,
+            obj_type: self.sm.hdr.obj_type,
+            subtype: self.sm.hdr.subtype,
+            data: self.sm_raw.clone(),
+        }];
 
+        // Node ids for free-queue leaves: the old non-root nodes' first.
+        let mut spare = std::mem::take(&mut self.fq_old_nodes);
+        spare.reverse();
         for (slot, q) in [SFQ_IP, SFQ_MAIN].into_iter().enumerate() {
-            let Some((obj_type, info)) = self.fq_roots[slot] else { continue };
+            let Some((root_type, info)) = self.fq_roots[slot] else { continue };
             let mut entries = self.fq[slot].clone();
             entries.sort();
-            let kv: Vec<_> = entries
+            let kv: Vec<Entry> = entries
                 .iter()
                 .map(|e| {
                     let mut k = e.xid.to_le_bytes().to_vec();
@@ -350,24 +422,84 @@ impl Space {
                     (k, (e.count != 1).then(|| e.count.to_le_bytes().to_vec()))
                 })
                 .collect();
-            let info = BTreeInfo { key_count: kv.len() as u64, node_count: 1, ..info };
-            let nb = NodeBuild {
-                oid: self.sm.fq[q].tree_oid,
-                xid,
-                obj_type,
-                subtype: crate::obj::OBJECT_TYPE_SPACEMAN_FREE_QUEUE,
-                level: 0,
-                root: true,
-                fixed: Some((16, 8)),
-                info,
-                entries: &kv,
+            let tree_oid = self.sm.fq[q].tree_oid;
+            let node_type = (root_type & !crate::obj::OBJECT_TYPE_MASK) | crate::obj::OBJECT_TYPE_BTREE_NODE;
+            let spec = |oid: u64, obj_type: u32, level: u16, root: bool, info: BTreeInfo, entries: &[Entry]| -> Result<Vec<u8>> {
+                build(
+                    &NodeBuild {
+                        oid,
+                        xid,
+                        obj_type,
+                        subtype: crate::obj::OBJECT_TYPE_SPACEMAN_FREE_QUEUE,
+                        level,
+                        root,
+                        fixed: Some((16, 8)),
+                        info,
+                        entries,
+                    },
+                    self.bs as usize,
+                )
             };
-            if !crate::btree_write::fits(&nb, self.bs as usize) {
-                return Err(unsupported("free queues longer than one B-tree node"));
+            let fits = |root: bool, level: u16, entries: &[Entry]| {
+                crate::btree_write::fits(
+                    &NodeBuild {
+                        oid: 0,
+                        xid,
+                        obj_type: root_type,
+                        subtype: 0,
+                        level,
+                        root,
+                        fixed: Some((16, 8)),
+                        info,
+                        entries,
+                    },
+                    self.bs as usize,
+                )
+            };
+            if fits(true, 0, &kv) {
+                let info = BTreeInfo { key_count: kv.len() as u64, node_count: 1, ..info };
+                out.push(EphObject { oid: tree_oid, obj_type: root_type, subtype: crate::obj::OBJECT_TYPE_SPACEMAN_FREE_QUEUE, data: spec(tree_oid, root_type, 0, true, info, &kv)? });
+                continue;
             }
-            out.push((self.sm.fq[q].tree_oid, build(&nb, self.bs as usize)?));
+            // Too many for one node: full leaves under one index root.
+            let mut leaves: Vec<&[Entry]> = Vec::new();
+            let mut rest = &kv[..];
+            while !rest.is_empty() {
+                let mut n = rest.len();
+                while n > 1 && !fits(false, 0, &rest[..n]) {
+                    n = (n * 9 / 10).max(1);
+                }
+                while n < rest.len() && fits(false, 0, &rest[..n + 1]) {
+                    n += 1;
+                }
+                leaves.push(&rest[..n]);
+                rest = &rest[n..];
+            }
+            let node_limit = self.sm.fq[q].tree_node_limit as usize;
+            if node_limit != 0 && leaves.len() + 1 > node_limit {
+                return Err(unsupported(format!("a free queue of {} nodes (the limit is {node_limit})", leaves.len() + 1)));
+            }
+            let info = BTreeInfo { key_count: kv.len() as u64, node_count: leaves.len() as u64 + 1, ..info };
+            let mut index = Vec::new();
+            for leaf in &leaves {
+                let oid = match spare.pop() {
+                    Some(o) => o,
+                    None => {
+                        let o = *next_oid;
+                        *next_oid += 1;
+                        o
+                    }
+                };
+                out.push(EphObject { oid, obj_type: node_type, subtype: crate::obj::OBJECT_TYPE_SPACEMAN_FREE_QUEUE, data: spec(oid, node_type, 0, false, info, leaf)? });
+                index.push((leaf[0].0.clone(), Some(oid.to_le_bytes().to_vec())));
+            }
+            if !fits(true, 1, &index) {
+                return Err(unsupported("free queues longer than two B-tree levels"));
+            }
+            out.push(EphObject { oid: tree_oid, obj_type: root_type, subtype: crate::obj::OBJECT_TYPE_SPACEMAN_FREE_QUEUE, data: spec(tree_oid, root_type, 1, true, info, &index)? });
         }
-        Ok((out, std::mem::take(&mut self.fq_old_nodes)))
+        // Old nodes not reused leave the checkpoint.
+        Ok((out, spare))
     }
 
     /// Writes the internal-pool bitmap to the next free block of its ring and

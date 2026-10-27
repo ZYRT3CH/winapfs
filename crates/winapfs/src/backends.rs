@@ -1,7 +1,6 @@
 //! Data sources for the WinFsp mount: an APFS volume, and a fixed in-memory
 //! tree for testing the Windows side without a Mac drive.
 
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use apfs::write::{NewKind, Session, Times};
@@ -68,8 +67,8 @@ pub struct ApfsRwBackend {
 }
 
 impl ApfsRwBackend {
-    pub fn new(image: &Path, vol: usize) -> apfs::Result<Self> {
-        let s = Session::open(image, vol)?;
+    /// Serves a session already open: on an image, a real disk, or an overlay.
+    pub fn from_session(s: Session) -> apfs::Result<Self> {
         let v = s.volume()?;
         let block_size = s.container().block_size() as u64;
         let (label, rule, serial, created) =
@@ -79,7 +78,7 @@ impl ApfsRwBackend {
         Ok(Self { s: Mutex::new(s), label, rule, serial, created, block_size, total, decompressed: Mutex::new(None) })
     }
 
-    fn session(&self) -> std::sync::MutexGuard<'_, Session> {
+    pub fn session(&self) -> std::sync::MutexGuard<'_, Session> {
         self.s.lock().unwrap_or_else(|p| p.into_inner())
     }
 }

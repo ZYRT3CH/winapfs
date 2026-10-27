@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use crate::automount::SERVICE_NAME;
 use crate::disks;
 use crate::winfsp::{wide, LaunchRecord, Launcher};
-use crate::{cmd_mount, source_path, CliError, CliResult, WINFSP_NOTICE};
+use crate::{cmd_mount, source_path, CliError, CliResult, MountMode, WINFSP_NOTICE};
 
 /// Launcher service class name, and the key under `HKLM\Software\WinFsp\Services`.
 pub(crate) const CLASS: &str = "winapfs";
@@ -452,7 +452,7 @@ pub fn is_elevated() -> bool {
 }
 
 /// `winapfs mount <disk> <X:>` through the launcher.
-pub fn mount(src: &str, mount_point: &str, vol: usize, part: Option<u32>) -> CliResult {
+pub fn mount(src: &str, mount_point: &str, vol: usize, part: Option<u32>, mode: MountMode) -> CliResult {
     let mut disk = disk_source(src).ok_or_else(|| CliError::new("the launcher can only mount whole disks (diskN)"))?;
     if disk == "auto" {
         // Resolve here, so the mount's command line names the disk (the auto-mount service relies on it).
@@ -471,20 +471,25 @@ pub fn mount(src: &str, mount_point: &str, vol: usize, part: Option<u32>) -> Cli
     if let Some(p) = part {
         args.push(format!("part={p}"));
     }
+    if let Some(m) = mode.arg() {
+        args.push(m.to_string());
+    }
     l.start(CLASS, &inst, &args).map_err(|e| CliError::new(e.to_string()))?;
 
     let log = install_dir().join("serve.log");
     let started = Instant::now();
     while !Path::new(&root).exists() {
         let gone = started.elapsed() > Duration::from_secs(2) && !running_here(&l, &inst);
-        if gone || started.elapsed() > Duration::from_secs(45) {
+        // Writable mounts check the whole space map first.
+        let limit = if mode == MountMode::ReadOnly { 45 } else { 300 };
+        if gone || started.elapsed() > Duration::from_secs(limit) {
             let _ = l.stop(CLASS, &inst);
             return Err(CliError::new(format!("winapfs could not mount {disk} at {inst}:"))
                 .hint(format!("details in {}", log.display())));
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    println!("mounted   {disk} volume {vol} at {inst}:, read-only, visible in Explorer");
+    println!("mounted   {disk} volume {vol} at {inst}:, {}, visible in Explorer", mode.describe());
     println!("stop      winapfs unmount {inst}:");
     println!("note      {WINFSP_NOTICE}");
     Ok(())
@@ -560,13 +565,15 @@ pub fn list() -> CliResult {
 /// whole disks (not files the caller may be unable to read) and drive
 /// letters (not folders, which would be created with SYSTEM's rights).
 pub fn serve(args: &[String]) -> CliResult {
-    let (mut src, mut at, mut vol, mut part) = (None, None, 0usize, None);
+    let (mut src, mut at, mut vol, mut part, mut mode) = (None, None, 0usize, None, MountMode::ReadOnly);
     for a in args {
         match a.split_once('=') {
             Some(("src", v)) => src = Some(v.to_string()),
             Some(("at", v)) => at = Some(v.to_string()),
             Some(("vol", v)) => vol = v.parse().map_err(|_| CliError::new(format!("bad vol={v}")))?,
             Some(("part", v)) => part = Some(v.parse().map_err(|_| CliError::new(format!("bad part={v}")))?),
+            Some(("mode", "write")) => mode = MountMode::Write,
+            Some(("mode", "rehearse")) => mode = MountMode::Rehearse,
             _ => {} // the launcher may pass the instance name or empty placeholders
         }
     }
@@ -576,10 +583,10 @@ pub fn serve(args: &[String]) -> CliResult {
         return Err(CliError::new(format!("serve mounts only at drive letters, not {at}")));
     }
     match src.as_str() {
-        "demo" => cmd_mount(None, &at, 0, None, false),
+        "demo" => cmd_mount(None, &at, 0, None, MountMode::ReadOnly),
         _ => {
             let disk = disk_source(&src).ok_or_else(|| CliError::new(format!("serve reads only whole disks, not {src}")))?;
-            cmd_mount(Some(&disk), &at, vol, part, false)
+            cmd_mount(Some(&disk), &at, vol, part, mode)
         }
     }
 }

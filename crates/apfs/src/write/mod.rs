@@ -258,8 +258,22 @@ impl Writer {
     /// Returns the transaction id.
     pub fn commit(&mut self, t: Txn) -> Result<u64> {
         let Txn { xid, space, mut writes, nx_omap_oid, next_oid } = t;
-        let (objects, dropped) = space.finish(&mut writes)?;
-        let ephemeral: HashMap<u64, Vec<u8>> = objects.into_iter().collect();
+        let mut next_oid = next_oid;
+        let (objects, dropped) = space.finish(&mut writes, &mut next_oid)?;
+        // New ephemeral objects (more free-queue nodes) join the checkpoint map.
+        let added: Vec<CheckpointMapping> = objects
+            .iter()
+            .filter(|o| !self.c.checkpoint_map.iter().any(|m| m.oid == o.oid))
+            .map(|o| CheckpointMapping {
+                obj_type: o.obj_type,
+                subtype: o.subtype,
+                size: self.c.block_size(),
+                fs_oid: 0,
+                oid: o.oid,
+                paddr: 0,
+            })
+            .collect();
+        let ephemeral: HashMap<u64, Vec<u8>> = objects.into_iter().map(|o| (o.oid, o.data)).collect();
 
         let sb = &self.c.sb;
         if sb.xp_desc_blocks & 0x8000_0000 != 0 || sb.xp_data_blocks & 0x8000_0000 != 0 {
@@ -275,7 +289,7 @@ impl Writer {
         let mut data_pos = data_start;
         let mut eph_writes: Vec<(u64, Vec<u8>)> = Vec::new();
         let mut mappings: Vec<CheckpointMapping> = Vec::new();
-        for m in self.c.checkpoint_map.iter().filter(|m| !dropped.contains(&m.oid)) {
+        for m in self.c.checkpoint_map.iter().filter(|m| !dropped.contains(&m.oid)).chain(&added) {
             let mut obj = match ephemeral.get(&m.oid) {
                 Some(updated) => updated.clone(),
                 None => {
