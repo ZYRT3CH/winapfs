@@ -184,7 +184,7 @@ impl Space {
                 return Ok(ch as u64 * bpc + i as u64);
             }
         }
-        Err(Error::Unsupported("the container is full".into()))
+        Err(Error::NoSpace("the container is full".into()))
     }
 
     /// Allocates up to `max` contiguous main-device blocks: the first free
@@ -215,7 +215,7 @@ impl Space {
             self.run_hint = ch;
             return Ok((ch as u64 * bpc + i as u64, (j - i) as u64));
         }
-        Err(Error::Unsupported("the container is full".into()))
+        Err(Error::NoSpace("the container is full".into()))
     }
 
     /// Queues a main-device block for freeing.
@@ -232,7 +232,7 @@ impl Space {
         let n = self.sm.ip_block_count as usize;
         let i = (0..n)
             .find(|&i| self.ip_bitmap[i / 8] >> (i % 8) & 1 == 0)
-            .ok_or_else(|| Error::Unsupported("the space manager's internal pool is full".into()))?;
+            .ok_or_else(|| Error::NoSpace("the space manager's internal pool is full".into()))?;
         self.ip_bitmap[i / 8] |= 1 << (i % 8);
         self.ip_dirty = true;
         Ok(self.sm.ip_base + i as u64)

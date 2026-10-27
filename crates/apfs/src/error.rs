@@ -14,6 +14,8 @@ pub enum Error {
     InvalidName(String),
     /// A folder that still has entries.
     NotEmpty(String),
+    /// No free space left.
+    NoSpace(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -28,6 +30,7 @@ impl fmt::Display for Error {
             Error::Exists(m) => write!(f, "already exists: {m}"),
             Error::InvalidName(m) => write!(f, "invalid name: {m}"),
             Error::NotEmpty(m) => write!(f, "folder not empty: {m}"),
+            Error::NoSpace(m) => write!(f, "out of space: {m}"),
         }
     }
 }

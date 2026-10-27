@@ -576,10 +576,10 @@ pub fn serve(args: &[String]) -> CliResult {
         return Err(CliError::new(format!("serve mounts only at drive letters, not {at}")));
     }
     match src.as_str() {
-        "demo" => cmd_mount(None, &at, 0, None),
+        "demo" => cmd_mount(None, &at, 0, None, false),
         _ => {
             let disk = disk_source(&src).ok_or_else(|| CliError::new(format!("serve reads only whole disks, not {src}")))?;
-            cmd_mount(Some(&disk), &at, vol, part)
+            cmd_mount(Some(&disk), &at, vol, part, false)
         }
     }
 }

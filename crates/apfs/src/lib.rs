@@ -27,5 +27,5 @@ pub mod write;
 pub use bytes::format_uuid;
 pub use dev::{BlockDevice, FileDevice, ImageFile, WriteDevice};
 pub use error::{Error, Result};
-pub use fs::{DirEntry, Extent, FileKind, Inode, Volume};
+pub use fs::{DirEntry, Extent, FileKind, Inode, NameRule, Volume};
 pub use nx::Container;

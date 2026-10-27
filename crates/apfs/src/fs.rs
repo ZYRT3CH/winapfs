@@ -185,6 +185,29 @@ pub struct Extent {
     pub phys_block: u64,
 }
 
+/// How a volume compares names: two names are the same entry exactly when
+/// their keys are equal.
+#[derive(Clone, Copy, Debug)]
+pub struct NameRule {
+    pub case_insensitive: bool,
+    pub normalization_insensitive: bool,
+}
+
+impl NameRule {
+    pub fn key(&self, name: &str) -> String {
+        let nfd = if self.normalization_insensitive || self.case_insensitive {
+            name.nfd().collect::<String>()
+        } else {
+            name.to_string()
+        };
+        if self.case_insensitive {
+            nfd.to_lowercase()
+        } else {
+            nfd
+        }
+    }
+}
+
 pub struct Volume<'c> {
     c: &'c Container,
     pub sb: ApfsSuperblock,
@@ -258,12 +281,14 @@ impl<'c> Volume<'c> {
     /// Two names refer to the same entry on this volume exactly when their
     /// keys are equal.
     pub fn name_key(&self, name: &str) -> String {
-        let nfd = if self.sb.incompat_features & APFS_INCOMPAT_NORMALIZATION_INSENSITIVE != 0 || self.sb.is_case_insensitive() {
-            name.nfd().collect::<String>()
-        } else {
-            name.to_string()
-        };
-        if self.sb.is_case_insensitive() { nfd.to_lowercase() } else { nfd }
+        self.name_rule().key(name)
+    }
+
+    pub fn name_rule(&self) -> NameRule {
+        NameRule {
+            case_insensitive: self.sb.is_case_insensitive(),
+            normalization_insensitive: self.sb.incompat_features & APFS_INCOMPAT_NORMALIZATION_INSENSITIVE != 0,
+        }
     }
 
     pub fn xattrs(&self, id: u64) -> Result<Vec<Xattr>> {

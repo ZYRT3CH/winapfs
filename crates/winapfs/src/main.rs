@@ -51,6 +51,7 @@ usage:
   --all      also copy macOS housekeeping folders (.Spotlight-V100, .fseventsd, ...)
   --dry-run  show what `get` would copy and rename, without writing anything
   --here     mount inside this terminal instead of through the launcher
+  --write    mount read-write: EXPERIMENTAL, disk image files only
 
 Raw disks can only be opened from an Administrator terminal.
 Mounting uses WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos
@@ -115,6 +116,7 @@ struct Args {
     all: bool,
     dry_run: bool,
     here: bool,
+    write: bool,
 }
 
 fn parse_args() -> CliResult<Args> {
@@ -125,7 +127,7 @@ fn parse_args() -> CliResult<Args> {
         "-h" | "--help" => "help".to_string(),
         _ => cmd,
     };
-    let mut a = Args { cmd, pos: Vec::new(), vol: 0, part: None, all: false, dry_run: false, here: false };
+    let mut a = Args { cmd, pos: Vec::new(), vol: 0, part: None, all: false, dry_run: false, here: false, write: false };
     while let Some(arg) = it.next() {
         let mut num = |flag: &str| -> CliResult<u64> {
             it.next()
@@ -138,6 +140,7 @@ fn parse_args() -> CliResult<Args> {
             "--all" => a.all = true,
             "--dry-run" => a.dry_run = true,
             "--here" => a.here = true,
+            "--write" => a.write = true,
             "-h" | "--help" => a.cmd = "help".into(),
             "-V" | "--version" => a.cmd = "version".into(),
             _ => a.pos.push(arg),
@@ -223,10 +226,10 @@ fn run(a: &Args) -> CliResult {
             let (src, at) = (&a.pos[0], &a.pos[1]);
             // Whole disk at a drive letter: go through the launcher when set up, so Explorer sees it.
             let disk_at_letter = service::is_drive_letter(at) && service::disk_source(src).is_some();
-            if !a.here && disk_at_letter && service::registered() {
+            if !a.here && !a.write && disk_at_letter && service::registered() {
                 service::mount(src, at, a.vol, a.part)
             } else {
-                cmd_mount(Some(src), at, a.vol, a.part).map_err(|e| match e.msg.starts_with("access denied") {
+                cmd_mount(Some(src), at, a.vol, a.part, a.write).map_err(|e| match e.msg.starts_with("access denied") {
                     true if disk_at_letter => e.hint(
                         "run `winapfs setup` once from an Administrator terminal; after that this works from a normal terminal",
                     ),
@@ -237,7 +240,7 @@ fn run(a: &Args) -> CliResult {
         #[cfg(windows)]
         "mount-demo" => {
             need(1)?;
-            cmd_mount(None, &a.pos[0], 0, None)
+            cmd_mount(None, &a.pos[0], 0, None, false)
         }
         #[cfg(windows)]
         "unmount" => {
@@ -816,13 +819,22 @@ fn cmd_verify(src: &str, vol: usize, part: Option<u32>) -> CliResult {
 
 /// Mounts an APFS volume (`src`) or, with `src == None`, the built-in demo tree.
 #[cfg(windows)]
-fn cmd_mount(src: Option<&str>, mount_point: &str, vol: usize, part: Option<u32>) -> CliResult {
+fn cmd_mount(src: Option<&str>, mount_point: &str, vol: usize, part: Option<u32>, write: bool) -> CliResult {
     let is_drive = mount_point.len() == 2 && mount_point.ends_with(':');
     if !is_drive && Path::new(mount_point).exists() {
         return Err(CliError::new(format!("{mount_point} already exists"))
             .hint("WinFsp creates the mount folder itself; pick a path that does not exist yet"));
     }
     let (backend, what): (&'static dyn mountfs::Backend, String) = match src {
+        Some(src) if write => {
+            if service::disk_source(src).is_some() || part.is_some() {
+                return Err(CliError::new("--write works only on disk image files for now")
+                    .hint("writing to real disks comes after more testing; images are safe to experiment on"));
+            }
+            let b = backends::ApfsRwBackend::new(Path::new(src), vol)?;
+            let what = format!("volume {vol} \"{}\" from {src}", mountfs::Backend::label(&b));
+            (Box::leak(Box::new(b)), what)
+        }
         Some(src) => {
             let (c, location) = open_source(src, part)?;
             let c: &'static Container = Box::leak(Box::new(c));
@@ -833,7 +845,8 @@ fn cmd_mount(src: Option<&str>, mount_point: &str, vol: usize, part: Option<u32>
         None => (Box::leak(Box::new(backends::DemoBackend::new())), "the built-in demo tree".to_string()),
     };
     let mounted = mountfs::mount(backend, mount_point).map_err(CliError::new)?;
-    println!("mounted   {what} at {mount_point}, read-only");
+    let mode = if write { "READ-WRITE (experimental)" } else { "read-only" };
+    println!("mounted   {what} at {mount_point}, {mode}");
     println!("stop      Ctrl+C here, or: winapfs unmount {mount_point}");
     println!("note      {WINFSP_NOTICE}");
     if is_drive && src.is_some_and(|s| service::disk_source(s).is_some()) && !service::registered() {
