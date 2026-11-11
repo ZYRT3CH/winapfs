@@ -8,6 +8,7 @@ mod backends;
 mod disks;
 mod dump;
 mod links;
+mod refs;
 #[cfg(windows)]
 mod rehearse;
 mod trace;
@@ -342,6 +343,15 @@ fn run(a: &Args) -> CliResult {
             match links::link_check_container(&c, &location)? {
                 0 => Ok(()),
                 n => Err(CliError::new(format!("{n} problems with names and links"))),
+            }
+        }
+        // dev-extent-check <source>: every block's reference count matches the files using it.
+        "dev-extent-check" => {
+            need(1)?;
+            let (c, location) = open_source(&a.pos[0], a.part)?;
+            match refs::extent_check_container(&c, &location)? {
+                0 => Ok(()),
+                n => Err(CliError::new(format!("{n} problems with block references"))),
             }
         }
         "dev-omap-check" => {
@@ -1167,6 +1177,79 @@ fn run_script(s: &mut Session, script: &str) -> CliResult {
     Ok(())
 }
 
+const ROOT_DIR: u64 = 2;
+
+/// See `clonewrite` in [`run_script_line`].
+fn clonewrite(s: &mut Session, path: &str) -> CliResult {
+    let id = s.lookup_path(path)?;
+    let v = s.volume()?;
+    let stream = v.inode(id)?.private_id;
+    let mut others = Vec::new();
+    v.scan_all(&mut |k, val| {
+        let h = u64::from_le_bytes(k[0..8].try_into().unwrap());
+        let other = h & 0x0fff_ffff_ffff_ffff;
+        if h >> 60 == 3 && other != id && val.get(8..16).is_some_and(|b| u64::from_le_bytes(b.try_into().unwrap()) == stream) {
+            others.push(other);
+        }
+        Ok(true)
+    })?;
+    if others.is_empty() {
+        return Err(CliError::new(format!("{path} shares its data stream with no other file")));
+    }
+    let read = |v: &Volume, id: u64| -> CliResult<Vec<u8>> {
+        let mut out = Vec::new();
+        v.read_file(&v.inode(id)?, &mut out)?;
+        Ok(out)
+    };
+    let mine = read(&v, id)?;
+    let theirs = others.iter().map(|&o| read(&v, o)).collect::<CliResult<Vec<_>>>()?;
+    drop(v);
+
+    let patch = vec![0xa5u8; mine.len().clamp(1, 4096)];
+    s.write(id, 0, &patch)?;
+    s.flush()?;
+    let v = s.volume()?;
+    let mut want = mine.clone();
+    want.splice(..patch.len().min(want.len()), patch.iter().copied());
+    if read(&v, id)? != want {
+        return Err(CliError::new(format!("{path} does not read back as written")));
+    }
+    for (&o, before) in others.iter().zip(&theirs) {
+        if &read(&v, o)? != before {
+            return Err(CliError::new(format!("inode {o}, which shared {path}'s data, changed")));
+        }
+    }
+    println!("  clonewrite {path}: wrote {} bytes; the {} other file(s) that shared its data are unchanged", patch.len(), others.len());
+    Ok(())
+}
+
+/// What `rmtree` did: deletions, and the refusals (not counting folders
+/// left only because something in them was refused).
+#[derive(Default)]
+struct Tree {
+    files: u64,
+    folders: u64,
+    refused: Vec<String>,
+}
+
+/// Deletes `name` (`inode`) from folder `dir`, and first everything in it.
+fn rmtree(s: &mut Session, dir: u64, name: &str, inode: &Inode, path: &str, t: &mut Tree) -> CliResult {
+    let is_dir = inode.kind() == FileKind::Directory;
+    let before = t.refused.len();
+    if is_dir {
+        for (child, ci) in s.list(inode.id)? {
+            rmtree(s, inode.id, &child, &ci, &format!("{path}/{child}"), t)?;
+        }
+    }
+    match s.remove(dir, name) {
+        Ok(()) if is_dir => t.folders += 1,
+        Ok(()) => t.files += 1,
+        Err(apfs::Error::NotEmpty(_)) if t.refused.len() > before => {}
+        Err(e) => t.refused.push(format!("{path}: {e}")),
+    }
+    Ok(())
+}
+
 /// A script line's words: split at spaces, except inside double quotes.
 fn script_words(line: &str) -> Vec<&str> {
     let mut out = Vec::new();
@@ -1202,6 +1285,27 @@ fn run_script_line(s: &mut Session, n: usize, line: &str, checks: &mut Vec<(usiz
             let (dir, name) = split_path(s, p)?;
             s.remove(dir, name).map_err(fail)?;
         }
+        // rmtree <path>: deletes a folder and everything in it, deepest
+        // first, going on past refusals (reported at the end). "/" empties
+        // the volume.
+        ["rmtree", p] => {
+            let p = p.trim_end_matches('/');
+            let mut t = Tree::default();
+            if p.is_empty() {
+                for (name, inode) in s.list(ROOT_DIR).map_err(fail)? {
+                    rmtree(s, ROOT_DIR, &name, &inode, &format!("/{name}"), &mut t)?;
+                }
+            } else {
+                let (dir, name) = split_path(s, p)?;
+                let id = s.lookup_path(p).map_err(fail)?;
+                let inode = s.inode(id).map_err(fail)?;
+                rmtree(s, dir, name, &inode, p, &mut t)?;
+            }
+            println!("  rmtree {p}: {} files and {} folders deleted, {} refused", t.files, t.folders, t.refused.len());
+            for r in t.refused.iter().take(20) {
+                println!("    refused: {r}");
+            }
+        }
         ["mv", from, to, rest @ ..] => {
             let (sdir, sname) = split_path(s, from)?;
             let (ddir, dname) = split_path(s, to)?;
@@ -1217,6 +1321,9 @@ fn run_script_line(s: &mut Session, n: usize, line: &str, checks: &mut Vec<(usiz
             let size: u64 = size.parse().map_err(|_| CliError::new(format!("line {}: bad size", n + 1)))?;
             s.set_size(id, size).map_err(fail)?;
         }
+        // clonewrite <path>: writes into a file whose data stream other files
+        // share (a fresh clone) and checks that only this file changed.
+        ["clonewrite", p] => clonewrite(s, p).map_err(|e| CliError::new(format!("line {}: {line}: {}", n + 1, e.msg)))?,
         // check <path> <local file>: after the commit, the file reads back
         // exactly as the local one.
         ["check", p, local] => checks.push((n + 1, p.to_string(), local.to_string())),
