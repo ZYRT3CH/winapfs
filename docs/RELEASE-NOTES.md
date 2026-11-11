@@ -1,5 +1,15 @@
 **Your Mac drive, on Windows. Read it. Write it.** Plug in a drive formatted on a Mac (APFS) and it shows up in File Explorer. It opens read-only; turn on write mode and you can save files onto it too (beta).
 
+### What's new in 0.1.4: deleting in write mode, fixed
+
+Three fixes for deleting and moving files on a Mac drive in write mode:
+
+- **Big deletes no longer lock the drive.** After deleting a lot at once (hundreds of GB), the next save could fail, and from then on the drive refused every change, even after plugging it back in. Freed space is now handed back over several saves, so deleting a terabyte works like deleting one file.
+- **A file that can't be deleted no longer stops the rest.** A file winapfs can't delete yet (for example one whose data is shared with a copy Finder made) is now refused on its own: Explorer shows an error for it, you skip it, and everything else is deleted. Before, Explorer showed such deletes as done while the drive quietly stopped accepting changes.
+- **Hard links can be deleted, renamed and moved.** Some apps give one file several names; DaVinci Resolve's project archives (`.dra`) do it for every media file. Folders holding such files could not be emptied before.
+
+Already using winapfs? Run the install command again (below). It replaces the old version, keeps write mode as it was, and brings your drive back in Explorer.
+
 ### What's new in 0.1.3: find out why a drive is slow
 
 **`winapfs usb`** checks every USB drive, Mac or not, and tells you why it might be slow: the speed its USB link actually got, whether the port can do better, USB-C, the storage driver (UAS) and Windows' write-cache setting. Anything that can go faster gets a one-line fix. It needs no admin rights and changes nothing, and the downloaded `winapfs.exe` works without any setup (`.\winapfs.exe usb` in its folder).
