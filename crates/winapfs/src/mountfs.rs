@@ -69,6 +69,11 @@ pub trait Backend: Send + Sync {
     fn writable(&self) -> bool {
         false
     }
+    /// A writable backend that has stopped accepting changes (after a save
+    /// failed): refused up front where Windows can still be told.
+    fn refuses_changes(&self) -> bool {
+        false
+    }
     fn read(&self, _id: u64, _off: u64, _buf: &mut [u8]) -> Result<usize, NTSTATUS> {
         Err(STATUS_NOT_SUPPORTED)
     }
@@ -88,6 +93,10 @@ pub trait Backend: Send + Sync {
     }
     fn remove(&self, _dir: u64, _name: &str) -> Result<(), NTSTATUS> {
         Err(STATUS_MEDIA_WRITE_PROTECTED)
+    }
+    /// Whether [`Backend::remove`] would succeed; changes nothing.
+    fn check_remove(&self, _dir: u64, _name: &str) -> Result<(), NTSTATUS> {
+        Ok(())
     }
     fn rename(&self, _sdir: u64, _sname: &str, _ddir: u64, _dname: &str, _replace: bool) -> Result<(), NTSTATUS> {
         Err(STATUS_MEDIA_WRITE_PROTECTED)
@@ -745,15 +754,21 @@ unsafe extern "system" fn set_file_size(
     })
 }
 
-unsafe extern "system" fn can_delete(fs: *mut FileSystem, file_context: *mut c_void, _name: *const u16) -> NTSTATUS {
+unsafe extern "system" fn can_delete(fs: *mut FileSystem, file_context: *mut c_void, name: *const u16) -> NTSTATUS {
     guard(|| {
         let me = this(fs);
-        if !me.writable {
+        // The delete itself happens at cleanup, which cannot report errors:
+        // refuse here, or Explorer shows the file as deleted and it stays.
+        if !me.writable || me.backend.refuses_changes() {
             return Err(STATUS_MEDIA_WRITE_PROTECTED);
         }
         let meta = handle(file_context).meta();
         if meta.is_dir && !me.backend.list(meta.id)?.is_empty() {
             return Err(STATUS_DIRECTORY_NOT_EMPTY);
+        }
+        if !name.is_null() {
+            let (dir, mac) = me.parent_and_name(wstr(name))?;
+            me.backend.check_remove(dir, &mac)?;
         }
         Ok(())
     })

@@ -321,24 +321,33 @@ impl Space {
         self.sm.dev[SD_MAIN].free_count
     }
 
-    /// Frees queued so far.
+    /// Frees queued so far, with the ones the commit will add: the old copy
+    /// of every chunk bitmap and chunk-info block this transaction changed.
     pub fn queued_frees(&self) -> usize {
-        self.fq.iter().map(Vec::len).sum()
+        self.fq.iter().map(Vec::len).sum::<usize>() + self.commit_frees()
+    }
+
+    /// Internal-pool frees the commit will add (see [`Space::finish`]): one
+    /// per changed chunk bitmap and one per changed chunk-info block.
+    fn commit_frees(&self) -> usize {
+        self.dirty_chunks.len() + self.cibs.iter().filter(|c| c.dirty).count()
+    }
+
+    /// Entries free queue `q` can hold within its node limit (and well
+    /// inside one checkpoint-map block): full leaves under one index root.
+    fn queue_capacity(&self, q: usize) -> usize {
+        // A leaf entry: a 16-byte key, an 8-byte count, a 4-byte table slot.
+        let per_leaf = (self.bs as usize - 56) / 28;
+        let limit = self.sm.fq[q].tree_node_limit as usize;
+        let nodes = if limit > 1 { limit.min(61) } else { 61 };
+        (nodes - 1) * per_leaf
     }
 
     /// Where a transaction should stop queueing frees and commit: half of
-    /// what fits under the free queues' node limits (and well inside one
-    /// checkpoint-map block), leaving room for the frees the commit adds.
+    /// what fits under the free queues' node limits, leaving room for the
+    /// frees the commit adds.
     pub fn queued_free_limit(&self) -> usize {
-        // A leaf entry: a 16-byte key, an 8-byte count, a 4-byte table slot.
-        let per_leaf = (self.bs as usize - 56) / 28;
-        let leaves = [SFQ_IP, SFQ_MAIN]
-            .iter()
-            .map(|&q| self.sm.fq[q].tree_node_limit as usize)
-            .filter(|&l| l > 1)
-            .fold(61, usize::min)
-            - 1;
-        leaves * per_leaf / 2
+        self.queue_capacity(SFQ_IP).min(self.queue_capacity(SFQ_MAIN)) / 2
     }
 
     fn ip_alloc(&mut self) -> Result<u64> {
@@ -369,18 +378,42 @@ impl Space {
                 self.ip_dirty[i / (self.bs as usize * 8)] = true;
             }
         }
-        let main_old: Vec<FqEntry> = self.fq[SFQ_MAIN].iter().filter(|e| e.xid <= durable).copied().collect();
-        self.fq[SFQ_MAIN].retain(|e| e.xid > durable);
+        // Every chunk whose bitmap changes here puts its old bitmap block in
+        // the internal pool's free queue at commit. After a big delete the
+        // released blocks can span more chunks than that queue may hold (a
+        // terabyte is ~8,000 chunks), so release only up to a share of its
+        // room. The rest stays queued, still allocated, which is safe, and
+        // the next transactions release it.
+        let budget = (self.queue_capacity(SFQ_IP) / 4).saturating_sub(self.fq[SFQ_IP].len());
         let bpc = self.sm.blocks_per_chunk as u64;
-        for e in main_old {
-            for b in e.paddr..e.paddr + e.count {
+        let mut queued = std::mem::take(&mut self.fq[SFQ_MAIN]);
+        queued.sort(); // oldest first
+        let mut keep = Vec::with_capacity(queued.len());
+        for e in queued {
+            if e.xid > durable {
+                keep.push(e);
+                continue;
+            }
+            let end = e.paddr + e.count;
+            let mut b = e.paddr;
+            while b < end {
                 let ch = (b / bpc) as usize;
-                let i = (b % bpc) as usize;
+                if !self.dirty_chunks.contains(&ch) && self.commit_frees() >= budget {
+                    break;
+                }
+                let stop = end.min((ch as u64 + 1) * bpc);
                 let bm = self.bitmap(c, ch)?;
-                bm[i / 8] &= !(1 << (i % 8));
-                self.add_chunk_free(ch, 1);
+                for i in (b % bpc) as usize..=((stop - 1) % bpc) as usize {
+                    bm[i / 8] &= !(1 << (i % 8));
+                }
+                self.add_chunk_free(ch, (stop - b) as i64);
+                b = stop;
+            }
+            if b < end {
+                keep.push(FqEntry { xid: e.xid, paddr: b, count: end - b });
             }
         }
+        self.fq[SFQ_MAIN] = keep;
         Ok(())
     }
 
@@ -511,7 +544,12 @@ impl Space {
             }
             let node_limit = self.sm.fq[q].tree_node_limit as usize;
             if node_limit != 0 && leaves.len() + 1 > node_limit {
-                return Err(unsupported(format!("a free queue of {} nodes (the limit is {node_limit})", leaves.len() + 1)));
+                let name = if q == SFQ_IP { "internal-pool" } else { "main" };
+                return Err(unsupported(format!(
+                    "a {name} free queue of {} nodes (the limit is {node_limit}; {} entries)",
+                    leaves.len() + 1,
+                    kv.len()
+                )));
             }
             let info = BTreeInfo { key_count: kv.len() as u64, node_count: leaves.len() as u64 + 1, ..info };
             let mut index = Vec::new();
