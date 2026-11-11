@@ -1,5 +1,17 @@
 **Your Mac drive, on Windows. Read it. Write it.** Plug in a drive formatted on a Mac (APFS) and it shows up in File Explorer. It opens read-only; turn on write mode and you can save files onto it too (beta).
 
+### What's new in 0.1.5: copies made on a Mac, handled
+
+macOS often copies a file without copying its data: the copy (a clone) shares the original's space on the drive until one of them changes. Finder's Duplicate does this, and so do many apps' caches. In write mode:
+
+- **Clones can be deleted.** Before, they were refused, and Explorer could show them as deleted while they stayed on the drive. Space they share stays with the other copy; space only they used is freed.
+- **Writing into a clone changes only that file.** Before, changing a fresh copy could also change the file it was copied from.
+- **A delete winapfs refuses now shows an error in Explorer** every time, instead of looking like it worked.
+
+Tested on a real 1.8 TB Mac drive with every change kept in memory: deleting every file and folder on it (about 250,000 files) went through with nothing refused, and the drive's records stayed consistent throughout.
+
+Already using winapfs? Run the install command again (below) to update.
+
 ### What's new in 0.1.4: deleting in write mode, fixed
 
 Three fixes for deleting and moving files on a Mac drive in write mode:
