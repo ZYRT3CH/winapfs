@@ -410,6 +410,10 @@ impl Backend for ApfsRwBackend {
         true
     }
 
+    fn refuses_changes(&self) -> bool {
+        self.failed.load(Ordering::SeqCst)
+    }
+
     fn read(&self, id: u64, off: u64, buf: &mut [u8]) -> Result<usize, NTSTATUS> {
         let start = Instant::now();
         let mut s = self.session();
@@ -477,6 +481,10 @@ impl Backend for ApfsRwBackend {
     fn remove(&self, dir: u64, name: &str) -> Result<(), NTSTATUS> {
         let _t = Timer(format!("remove {name:?} from {dir}"), Instant::now());
         self.change(&mut self.session(), |s| s.remove(dir, name))
+    }
+
+    fn check_remove(&self, dir: u64, name: &str) -> Result<(), NTSTATUS> {
+        self.session().check_remove(dir, name).map_err(status)
     }
 
     fn rename(&self, sdir: u64, sname: &str, ddir: u64, dname: &str, replace: bool) -> Result<(), NTSTATUS> {

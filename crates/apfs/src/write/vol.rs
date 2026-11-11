@@ -40,7 +40,6 @@ pub struct Times {
 }
 
 const XATTR_DATA_STREAM: u16 = 0x1;
-const APFS_TYPE_SIBLING_LINK: u64 = 5;
 pub(super) const ROOT_DIR_INO: u64 = 2;
 /// Most file data queued before it is written out (8 MiB).
 const PENDING_IO_MAX: usize = 8 << 20;
@@ -73,6 +72,33 @@ struct FileState {
     written: u64,
     /// Data changed since the extent records were last rewritten.
     dirty: bool,
+}
+
+/// One name of a hard-linked file: its sibling-link record.
+struct Sibling {
+    id: u64,
+    parent: u64,
+    name: String,
+    key: Vec<u8>,
+}
+
+/// The sibling-link records among a file's records.
+fn siblings(records: &[Entry]) -> Result<Vec<Sibling>> {
+    records
+        .iter()
+        .filter(|(k, _)| fs::key_type(k) == fs::APFS_TYPE_SIBLING_LINK)
+        .map(|(k, v)| {
+            let (parent, name) = fs::parse_sibling_val(v.as_deref().ok_or_else(|| corrupt("sibling-link record without a value"))?)?;
+            Ok(Sibling { id: u64_at(k, 8)?, parent, name, key: k.clone() })
+        })
+        .collect()
+}
+
+/// A name as an inode's name field stores it: NUL-terminated.
+fn name_z(name: &str) -> Vec<u8> {
+    let mut z = name.as_bytes().to_vec();
+    z.push(0);
+    z
 }
 
 /// One volume's changes in the open transaction.
@@ -217,6 +243,46 @@ impl<'a, 'c> VolEdit<'a, 'c> {
         Ok(self.range(&lo, &hi)?.into_iter().find(|(k, _)| self.v.name_key(&fs::drec_name(k)) == want))
     }
 
+    /// The sibling-link records of file `id`: one per name, if it has had several.
+    fn links_of(&mut self, id: u64) -> Result<Vec<Sibling>> {
+        let lo = fs::key_bound_type(id, fs::APFS_TYPE_SIBLING_LINK);
+        let hi = fs::key_bound_type(id, fs::APFS_TYPE_SIBLING_LINK + 1);
+        siblings(&self.range(&lo, &hi)?)
+    }
+
+    /// Which of `links` the entry `name` in `dir` (whose value is `drec`)
+    /// is: by the sibling id the entry carries, or else by folder and name.
+    fn link_of(&self, dir: u64, name: &str, drec: &[u8], links: &[Sibling]) -> Result<usize> {
+        let (_, fields) = fs::split_xfields(drec, fs::DREC_FIXED)?;
+        let found = match fields.iter().find(|f| f.0 == fs::DREC_EXT_TYPE_SIBLING_ID) {
+            Some(f) => {
+                let id = u64_at(&f.2, 0)?;
+                links.iter().position(|s| s.id == id)
+            }
+            None => {
+                let want = self.v.name_key(name);
+                links.iter().position(|s| s.parent == dir && self.v.name_key(&s.name) == want)
+            }
+        };
+        found.ok_or_else(|| unsupported(format!("a hard link without its sibling record ({name:?})")))
+    }
+
+    /// Whether inode `raw` carries the folder and name of the link `name` in
+    /// `dir`: its primary link.
+    fn is_primary(&self, raw: &[u8], dir: u64, name: &str) -> Result<bool> {
+        if u64_at(raw, 0)? != dir {
+            return Ok(false);
+        }
+        let (_, fields) = fs::split_inode(raw)?;
+        Ok(match fields.iter().find(|f| f.0 == fs::INO_EXT_TYPE_NAME) {
+            Some(f) => {
+                let stored = f.2.strip_suffix(&[0]).unwrap_or(&f.2);
+                self.v.name_key(&String::from_utf8_lossy(stored)) == self.v.name_key(name)
+            }
+            None => true,
+        })
+    }
+
     pub fn create(&mut self, dir: u64, name: &str, kind: NewKind, now: u64) -> Result<u64> {
         check_name(name)?;
         self.folder(dir)?;
@@ -236,30 +302,125 @@ impl<'a, 'c> VolEdit<'a, 'c> {
         Ok(id)
     }
 
-    /// Removes the file or empty folder `name` from `dir`.
+    /// Finds, without changing anything, every reason [`VolEdit::unlink`]
+    /// would refuse `name` in `dir`. Refused here, a delete leaves the rest of
+    /// the transaction alone; refused halfway through, it would cost the
+    /// whole transaction.
+    pub fn check_unlink(&mut self, dir: u64, name: &str) -> Result<()> {
+        let (_, val) = self.find_entry(dir, name)?.ok_or_else(|| Error::NotFound(format!("{name:?}")))?;
+        let val = val.ok_or_else(|| corrupt("directory entry without a value"))?;
+        let id = u64_at(&val, 0)?;
+        let raw = self.inode_raw(id)?;
+        let children_or_links = i32::from_le_bytes(raw[56..60].try_into().unwrap());
+        if fs::is_dir(&raw) {
+            if children_or_links != 0 {
+                return Err(Error::NotEmpty(format!("{name:?}")));
+            }
+            return Ok(());
+        }
+        if children_or_links > 1 {
+            // Only this name goes: its records must be there, and so must
+            // another name's, for the file to take.
+            let links = self.links_of(id)?;
+            let this = self.link_of(dir, name, &val, &links)?;
+            if !(0..links.len()).any(|i| i != this) {
+                return Err(unsupported(format!("a hard-linked file whose other names have no sibling records ({name:?})")));
+            }
+            return Ok(());
+        }
+        if children_or_links != 1 {
+            return Err(unsupported(format!("deleting a file whose link count is {children_or_links} ({name:?})")));
+        }
+        let stream = u64_at(&raw, 8)?;
+        let mut records = self.range(&fs::key_bound(id), &fs::key_bound(id + 1))?;
+        if stream != id {
+            records.extend(self.range(&fs::key_bound(stream), &fs::key_bound(stream + 1))?);
+        }
+        // Every block the delete would release must be this file's alone.
+        let mut runs = match self.st.files.get(&id) {
+            Some(f) => f.runs.iter().filter(|r| !r.fresh).map(|r| (r.phys, r.blocks)).collect(),
+            None => self.stream_runs(stream)?,
+        };
+        for (k, v) in &records {
+            if fs::key_type(k) == fs::APFS_TYPE_XATTR {
+                let v = v.as_deref().unwrap_or_default();
+                if u16_at(v, 0)? & XATTR_DATA_STREAM != 0 {
+                    runs.extend(self.stream_runs(u64_at(v, 4)?)?);
+                }
+            }
+        }
+        for (phys, blocks) in runs {
+            self.extent_owner(phys, blocks)?;
+        }
+        Ok(())
+    }
+
+    /// A data stream's stored extents: (first block, blocks), holes left out.
+    fn stream_runs(&mut self, stream: u64) -> Result<Vec<(u64, u64)>> {
+        let bs = self.bs();
+        let (lo, hi) = fs::file_extent_range(stream);
+        let mut out = Vec::new();
+        for (_, v) in self.range(&lo, &hi)? {
+            let v = v.ok_or_else(|| corrupt("file extent without a value"))?;
+            let (len, phys) = (u64_at(&v, 0)? & fs::FILE_EXTENT_LEN_MASK, u64_at(&v, 8)?);
+            if phys != 0 {
+                out.push((phys, len.div_ceil(bs)));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The extent reference covering `blocks` blocks from `phys`, as (key,
+    /// first block, length, owner), refused unless only one file uses them.
+    fn extent_owner(&mut self, phys: u64, blocks: u64) -> Result<(Vec<u8>, u64, u64, u64)> {
+        let rd = PhysReader(self.v.container());
+        let x = self.extref()?;
+        let (k, v) = x
+            .floor(&rd, &fs::phys_ext_key(phys))?
+            .ok_or_else(|| corrupt(format!("no extent reference for block {phys:#x}")))?;
+        let v = v.ok_or_else(|| corrupt("extent reference without a value"))?;
+        let start = fs::key_id(&k);
+        let (rlen, owner, refcnt) = (u64_at(&v, 0)? & fs::PEXT_LEN_MASK, u64_at(&v, 8)?, u32_at(&v, 16)? as i32);
+        if start + rlen < phys + blocks {
+            return Err(corrupt(format!("blocks {phys:#x}+{blocks} are not covered by an extent reference")));
+        }
+        if refcnt != 1 {
+            return Err(unsupported("changing data shared with clones or snapshots"));
+        }
+        Ok((k, start, rlen, owner))
+    }
+
+    /// Removes the file or empty folder `name` from `dir`. A file with
+    /// several names (hard links) loses only this one.
     pub fn unlink(&mut self, t: &mut Txn, dir: u64, name: &str, now: u64) -> Result<()> {
         let (key, val) = self.find_entry(dir, name)?.ok_or_else(|| Error::NotFound(format!("{name:?}")))?;
-        let id = u64_at(val.as_deref().ok_or_else(|| corrupt("directory entry without a value"))?, 0)?;
+        let val = val.ok_or_else(|| corrupt("directory entry without a value"))?;
+        let id = u64_at(&val, 0)?;
         let raw = self.inode_raw(id)?;
         let children_or_links = i32::from_le_bytes(raw[56..60].try_into().unwrap());
         let is_dir = fs::is_dir(&raw);
         if is_dir && children_or_links != 0 {
             return Err(Error::NotEmpty(format!("{name:?}")));
         }
+        if !is_dir && children_or_links > 1 {
+            return self.unlink_link(dir, name, &key, &val, now);
+        }
         if !is_dir && children_or_links != 1 {
-            return Err(unsupported("deleting files with several hard links"));
+            return Err(unsupported(format!("deleting a file whose link count is {children_or_links}")));
         }
         let stream = u64_at(&raw, 8)?;
-        // Everything keyed by the inode (and its data stream) goes.
+        // Everything keyed by the inode (and its data stream) goes, sibling
+        // links included if the file once had several names.
         let mut records = self.range(&fs::key_bound(id), &fs::key_bound(id + 1))?;
+        let links = siblings(&records)?;
         if stream != id {
             records.extend(self.range(&fs::key_bound(stream), &fs::key_bound(stream + 1))?);
         }
-        if records.iter().any(|(k, _)| fs::key_type(k) == APFS_TYPE_SIBLING_LINK) {
-            return Err(unsupported("deleting files with hard links"));
-        }
 
         self.remove(&key)?;
+        for s in &links {
+            self.remove(&fs::sibling_map_key(s.id))?;
+        }
         self.touch_folder(dir, -1, now)?;
         self.drop_file_data(t, id, stream)?;
         for (k, v) in records {
@@ -277,9 +438,65 @@ impl<'a, 'c> VolEdit<'a, 'c> {
         self.bump(if is_dir { 192 } else { 184 }, -1)
     }
 
+    /// Removes one name of a file that has several: its directory entry
+    /// `key` (value `drec`), its sibling-link and sibling-map records, and
+    /// one from the link count. If the inode carried this name (its primary
+    /// link), it takes the folder and name of the remaining link with the
+    /// lowest sibling id. The file and its data stay.
+    fn unlink_link(&mut self, dir: u64, name: &str, key: &[u8], drec: &[u8], now: u64) -> Result<()> {
+        let id = u64_at(drec, 0)?;
+        let raw = self.inode_raw(id)?;
+        let links = self.links_of(id)?;
+        let this = self.link_of(dir, name, drec, &links)?;
+        let next = (0..links.len())
+            .filter(|&i| i != this)
+            .min_by_key(|&i| links[i].id)
+            .ok_or_else(|| unsupported(format!("a hard-linked file whose other names have no sibling records ({name:?})")))?;
+        let (mut fixed, mut fields) = fs::split_inode(&raw)?;
+        let count = i32::from_le_bytes(fixed[56..60].try_into().unwrap());
+        fixed[56..60].copy_from_slice(&(count - 1).to_le_bytes());
+        put_u64(&mut fixed, 32, now); // change_time
+        if self.is_primary(&raw, dir, name)? {
+            let s = &links[next];
+            put_u64(&mut fixed, 0, s.parent); // parent_id
+            let flags = fields.iter().find(|f| f.0 == fs::INO_EXT_TYPE_NAME).map_or(fs::XF_DO_NOT_COPY, |f| f.1);
+            fs::set_xfield(&mut fields, fs::INO_EXT_TYPE_NAME, flags, name_z(&s.name));
+        }
+        self.remove(key)?;
+        self.touch_folder(dir, -1, now)?;
+        self.remove(&links[this].key)?;
+        self.remove(&fs::sibling_map_key(links[this].id))?;
+        self.put(fs::inode_key(id), fs::join_inode(&fixed, &fields))
+    }
+
+    /// Finds, without changing anything, what [`VolEdit::rename`] would
+    /// refuse partway: a hard link without its sibling record, or a target
+    /// to replace that [`VolEdit::check_unlink`] refuses.
+    pub fn check_rename(&mut self, sdir: u64, sname: &str, ddir: u64, dname: &str, replace: bool) -> Result<()> {
+        let (_, sval) = self.find_entry(sdir, sname)?.ok_or_else(|| Error::NotFound(format!("{sname:?}")))?;
+        let sval = sval.ok_or_else(|| corrupt("directory entry without a value"))?;
+        let id = u64_at(&sval, 0)?;
+        let is_dir = fs::is_dir(&self.inode_raw(id)?);
+        if !is_dir {
+            let links = self.links_of(id)?;
+            if !links.is_empty() {
+                self.link_of(sdir, sname, &sval, &links)?;
+            }
+        }
+        if let (true, Some((_, Some(dval)))) = (replace, self.find_entry(ddir, dname)?) {
+            let did = u64_at(&dval, 0)?;
+            if did != id && fs::is_dir(&self.inode_raw(did)?) == is_dir {
+                self.check_unlink(ddir, dname)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Moves `sname` in `sdir` to `dname` in `ddir`. An existing target is
     /// replaced only if `replace` is set and it is a file, or an empty
-    /// folder when moving a folder.
+    /// folder when moving a folder. One name of a hard-linked file moves
+    /// alone: its sibling record follows it, and the inode's own folder and
+    /// name only if they were this name's.
     pub fn rename(&mut self, t: &mut Txn, sdir: u64, sname: &str, ddir: u64, dname: &str, replace: bool, now: u64) -> Result<()> {
         check_name(dname)?;
         let (skey, sval) = self.find_entry(sdir, sname)?.ok_or_else(|| Error::NotFound(format!("{sname:?}")))?;
@@ -287,6 +504,9 @@ impl<'a, 'c> VolEdit<'a, 'c> {
         let id = u64_at(&sval, 0)?;
         self.folder(ddir)?;
         let mut raw = self.inode_raw(id)?;
+        let links = if fs::is_dir(&raw) { Vec::new() } else { self.links_of(id)? };
+        let link = if links.is_empty() { None } else { Some(self.link_of(sdir, sname, &sval, &links)?) };
+        let primary = link.is_none() || self.is_primary(&raw, sdir, sname)?;
         if fs::is_dir(&raw) {
             // A folder cannot move into itself or below itself.
             let mut up = ddir;
@@ -299,6 +519,10 @@ impl<'a, 'c> VolEdit<'a, 'c> {
         }
         if let Some((_, dval)) = self.find_entry(ddir, dname)? {
             let did = u64_at(dval.as_deref().unwrap_or_default(), 0)?;
+            if did == id && !(sdir == ddir && self.v.name_key(sname) == self.v.name_key(dname)) {
+                // Two names of one file: renaming one onto the other changes nothing.
+                return Ok(());
+            }
             if did != id {
                 if !replace {
                     return Err(Error::Exists(format!("{dname:?}")));
@@ -316,14 +540,20 @@ impl<'a, 'c> VolEdit<'a, 'c> {
         if sdir != ddir {
             self.touch_folder(sdir, -1, now)?;
             self.touch_folder(ddir, 1, now)?;
-            put_u64(&mut raw, 0, ddir); // parent_id
+            if primary {
+                put_u64(&mut raw, 0, ddir); // parent_id
+            }
         } else {
             self.touch_folder(sdir, 0, now)?;
         }
         let (mut fixed, mut fields) = fs::split_inode(&raw)?;
-        let mut name_z = dname.as_bytes().to_vec();
-        name_z.push(0);
-        fs::set_xfield(&mut fields, fs::INO_EXT_TYPE_NAME, fs::XF_DO_NOT_COPY, name_z);
+        if primary {
+            let flags = fields.iter().find(|f| f.0 == fs::INO_EXT_TYPE_NAME).map_or(fs::XF_DO_NOT_COPY, |f| f.1);
+            fs::set_xfield(&mut fields, fs::INO_EXT_TYPE_NAME, flags, name_z(dname));
+        }
+        if let Some(i) = link {
+            self.put(links[i].key.clone(), fs::sibling_val(ddir, dname))?;
+        }
         put_u64(&mut fixed, 32, now); // change_time
         self.put(fs::inode_key(id), fs::join_inode(&fixed, &fields))
     }
@@ -739,20 +969,9 @@ impl<'a, 'c> VolEdit<'a, 'c> {
     /// Frees `blocks` blocks from `phys` and takes them out of the
     /// extent-reference tree, splitting a record that covers more.
     fn release_extent(&mut self, t: &mut Txn, phys: u64, blocks: u64) -> Result<()> {
+        let (k, start, rlen, owner) = self.extent_owner(phys, blocks)?;
         let rd = PhysReader(self.v.container());
         let x = self.extref()?;
-        let (k, v) = x
-            .floor(&rd, &fs::phys_ext_key(phys))?
-            .ok_or_else(|| corrupt(format!("no extent reference for block {phys:#x}")))?;
-        let v = v.ok_or_else(|| corrupt("extent reference without a value"))?;
-        let start = fs::key_id(&k);
-        let (rlen, owner, refcnt) = (u64_at(&v, 0)? & fs::PEXT_LEN_MASK, u64_at(&v, 8)?, u32_at(&v, 16)? as i32);
-        if start + rlen < phys + blocks {
-            return Err(corrupt(format!("blocks {phys:#x}+{blocks} are not covered by an extent reference")));
-        }
-        if refcnt != 1 {
-            return Err(unsupported("changing data shared with clones or snapshots"));
-        }
         x.remove(&rd, &k)?;
         if start < phys {
             x.upsert(&rd, fs::phys_ext_key(start), Some(fs::phys_ext_val(phys - start, owner, 1)))?;

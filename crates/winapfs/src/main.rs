@@ -7,6 +7,7 @@ mod backends;
 #[cfg(windows)]
 mod disks;
 mod dump;
+mod links;
 #[cfg(windows)]
 mod rehearse;
 mod trace;
@@ -333,6 +334,15 @@ fn run(a: &Args) -> CliResult {
         "dev-space-check" => {
             need(1)?;
             dump::space_check(&a.pos[0], a.part)
+        }
+        // dev-link-check <source>: every name matches its records, hard links included.
+        "dev-link-check" => {
+            need(1)?;
+            let (c, location) = open_source(&a.pos[0], a.part)?;
+            match links::link_check_container(&c, &location)? {
+                0 => Ok(()),
+                n => Err(CliError::new(format!("{n} problems with names and links"))),
+            }
         }
         "dev-omap-check" => {
             need(1)?;
@@ -1085,6 +1095,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn script_words_keep_quoted_paths() {
+        assert_eq!(script_words(r#"rm "/A B/# c d@e.jpg""#), ["rm", "/A B/# c d@e.jpg"]);
+        assert_eq!(script_words("  mv /a   /b replace "), ["mv", "/a", "/b", "replace"]);
+        assert!(script_words("   ").is_empty());
+    }
+
+    #[test]
     fn disk_sources() {
         assert_eq!(source_path("disk3"), r"\\.\PhysicalDrive3");
         assert_eq!(source_path("Disk:12"), r"\\.\PhysicalDrive12");
@@ -1126,43 +1143,14 @@ fn run_script(s: &mut Session, script: &str) -> CliResult {
     let text = fs::read_to_string(script)?;
     let mut checks = Vec::new();
     for (n, line) in text.lines().enumerate() {
-        let w: Vec<&str> = line.split_whitespace().collect();
-        let fail = |e: apfs::Error| CliError::new(format!("line {}: {line}: {e}", n + 1));
-        let id_of = |s: &mut Session, p: &str| s.lookup_path(p);
-        match w.as_slice() {
-            [] => {}
-            [c, ..] if c.starts_with('#') => {}
-            ["flush"] => s.flush().map_err(fail)?,
-            // batch: from here on, everything is one transaction (until flush).
-            ["batch"] => s.set_batch(true),
-            ["mkdir", p] | ["touch", p] => {
-                let kind = if w[0] == "mkdir" { NewKind::Folder } else { NewKind::File };
-                let (dir, name) = split_path(s, p)?;
-                s.create(dir, name, kind).map_err(fail)?;
-            }
-            ["rm", p] => {
-                let (dir, name) = split_path(s, p)?;
-                s.remove(dir, name).map_err(fail)?;
-            }
-            ["mv", from, to, rest @ ..] => {
-                let (sdir, sname) = split_path(s, from)?;
-                let (ddir, dname) = split_path(s, to)?;
-                s.rename(sdir, sname, ddir, dname, rest == ["replace"]).map_err(fail)?;
-            }
-            ["write", p, off, local] => {
-                let id = id_of(s, p).map_err(fail)?;
-                let off: u64 = off.parse().map_err(|_| CliError::new(format!("line {}: bad offset", n + 1)))?;
-                s.write(id, off, &fs::read(local)?).map_err(fail)?;
-            }
-            ["size", p, size] => {
-                let id = id_of(s, p).map_err(fail)?;
-                let size: u64 = size.parse().map_err(|_| CliError::new(format!("line {}: bad size", n + 1)))?;
-                s.set_size(id, size).map_err(fail)?;
-            }
-            // check <path> <local file>: after the commit, the file reads back
-            // exactly as the local one.
-            ["check", p, local] => checks.push((n + 1, p.to_string(), local.to_string())),
-            _ => return Err(CliError::new(format!("line {}: cannot parse {line:?}", n + 1))),
+        // refused <command>: the command must fail, and the script goes on.
+        let Some(command) = line.trim_start().strip_prefix("refused ") else {
+            run_script_line(s, n, line, &mut checks)?;
+            continue;
+        };
+        match run_script_line(s, n, command, &mut checks) {
+            Ok(()) => return Err(CliError::new(format!("line {}: {line}: expected a refusal, but it worked", n + 1))),
+            Err(e) => println!("  refused as expected: {}", e.msg),
         }
     }
     s.flush()?;
@@ -1175,6 +1163,64 @@ fn run_script(s: &mut Session, script: &str) -> CliResult {
             return Err(CliError::new(format!("line {line}: {p} reads back differently ({} bytes, expected {})", got.len(), want.len())));
         }
         println!("  check ok: {p} ({} bytes)", got.len());
+    }
+    Ok(())
+}
+
+/// A script line's words: split at spaces, except inside double quotes.
+fn script_words(line: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = line.trim_start();
+    while !rest.is_empty() {
+        let (word, after) = match rest.strip_prefix('"') {
+            Some(q) => q.split_once('"').unwrap_or((q, "")),
+            None => rest.split_once(char::is_whitespace).unwrap_or((rest, "")),
+        };
+        out.push(word);
+        rest = after.trim_start();
+    }
+    out
+}
+
+/// Runs one script line (line `n`, counting from 0).
+fn run_script_line(s: &mut Session, n: usize, line: &str, checks: &mut Vec<(usize, String, String)>) -> CliResult {
+    let w = script_words(line);
+    let fail = |e: apfs::Error| CliError::new(format!("line {}: {line}: {e}", n + 1));
+    let id_of = |s: &mut Session, p: &str| s.lookup_path(p);
+    match w.as_slice() {
+        [] => {}
+        [c, ..] if c.starts_with('#') => {}
+        ["flush"] => s.flush().map_err(fail)?,
+        // batch: from here on, everything is one transaction (until flush).
+        ["batch"] => s.set_batch(true),
+        ["mkdir", p] | ["touch", p] => {
+            let kind = if w[0] == "mkdir" { NewKind::Folder } else { NewKind::File };
+            let (dir, name) = split_path(s, p)?;
+            s.create(dir, name, kind).map_err(fail)?;
+        }
+        ["rm", p] => {
+            let (dir, name) = split_path(s, p)?;
+            s.remove(dir, name).map_err(fail)?;
+        }
+        ["mv", from, to, rest @ ..] => {
+            let (sdir, sname) = split_path(s, from)?;
+            let (ddir, dname) = split_path(s, to)?;
+            s.rename(sdir, sname, ddir, dname, rest == ["replace"]).map_err(fail)?;
+        }
+        ["write", p, off, local] => {
+            let id = id_of(s, p).map_err(fail)?;
+            let off: u64 = off.parse().map_err(|_| CliError::new(format!("line {}: bad offset", n + 1)))?;
+            s.write(id, off, &fs::read(local)?).map_err(fail)?;
+        }
+        ["size", p, size] => {
+            let id = id_of(s, p).map_err(fail)?;
+            let size: u64 = size.parse().map_err(|_| CliError::new(format!("line {}: bad size", n + 1)))?;
+            s.set_size(id, size).map_err(fail)?;
+        }
+        // check <path> <local file>: after the commit, the file reads back
+        // exactly as the local one.
+        ["check", p, local] => checks.push((n + 1, p.to_string(), local.to_string())),
+        _ => return Err(CliError::new(format!("line {}: cannot parse {line:?}", n + 1))),
     }
     Ok(())
 }

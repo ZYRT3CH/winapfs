@@ -706,14 +706,32 @@ impl Session {
         self.edit_and_flush(|e, _, _| names.iter().map(|n| e.create(dir, n, kind, now)).collect())
     }
 
-    /// Deletes a file or an empty folder.
+    /// Deletes a file or an empty folder. What cannot be deleted is refused
+    /// before anything changes, so the transaction's other changes stay.
     pub fn remove(&mut self, dir: u64, name: &str) -> Result<()> {
+        self.check_remove(dir, name)?;
         let now = now_ns();
         self.edit_and_flush(|e, t, _| e.unlink(t, dir, name, now))
     }
 
-    /// Moves or renames an entry; see [`VolEdit::rename`].
+    /// Whether [`Session::remove`] would delete `name` from `dir`; reads only.
+    pub fn check_remove(&mut self, dir: u64, name: &str) -> Result<()> {
+        self.inspect(|e| e.check_unlink(dir, name))
+    }
+
+    /// Runs `f`, which only reads, on the open transaction (starting one if
+    /// needed). Unlike [`Session::edit`], an error keeps the transaction.
+    fn inspect<R>(&mut self, f: impl FnOnce(&mut VolEdit) -> Result<R>) -> Result<R> {
+        self.begin_if_needed()?;
+        let v = self.w.c.volume(self.vol)?;
+        let (_, st) = self.open.as_mut().unwrap();
+        f(&mut VolEdit { v: &v, st })
+    }
+
+    /// Moves or renames an entry; see [`VolEdit::rename`]. What it cannot do
+    /// is refused before anything changes, as with [`Session::remove`].
     pub fn rename(&mut self, sdir: u64, sname: &str, ddir: u64, dname: &str, replace: bool) -> Result<()> {
+        self.inspect(|e| e.check_rename(sdir, sname, ddir, dname, replace))?;
         let now = now_ns();
         self.edit_and_flush(|e, t, _| e.rename(t, sdir, sname, ddir, dname, replace, now))
     }

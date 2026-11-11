@@ -9,9 +9,16 @@ const OBJ_ID_MASK: u64 = 0x0fff_ffff_ffff_ffff;
 const APFS_TYPE_EXTENT: u64 = 2;
 const APFS_TYPE_INODE: u64 = 3;
 pub const APFS_TYPE_XATTR: u64 = 4;
+pub const APFS_TYPE_SIBLING_LINK: u64 = 5;
 const APFS_TYPE_DSTREAM_ID: u64 = 6;
 const APFS_TYPE_FILE_EXTENT: u64 = 8;
 pub const APFS_TYPE_DIR_REC: u64 = 9;
+const APFS_TYPE_SIBLING_MAP: u64 = 12;
+
+/// Fixed part of `j_drec_val_t` (file id, date added, flags); extended fields follow.
+pub const DREC_FIXED: usize = 18;
+/// A hard link's sibling id, in its directory entry.
+pub const DREC_EXT_TYPE_SIBLING_ID: u8 = 1;
 
 pub const DT_REG: u16 = 8;
 pub const DT_DIR: u16 = 4;
@@ -139,6 +146,28 @@ pub fn phys_ext_val(blocks: u64, owner: u64, refcnt: i32) -> Vec<u8> {
     v
 }
 
+/// `j_sibling_map_key_t`: which inode hard link `sibling` belongs to.
+pub fn sibling_map_key(sibling: u64) -> Vec<u8> {
+    hdr(sibling, APFS_TYPE_SIBLING_MAP).to_vec()
+}
+
+/// `j_sibling_val_t`: a hard link's folder and name.
+pub fn sibling_val(parent: u64, name: &str) -> Vec<u8> {
+    let mut v = parent.to_le_bytes().to_vec();
+    v.extend((name.len() as u16 + 1).to_le_bytes());
+    v.extend(name.as_bytes());
+    v.push(0);
+    v
+}
+
+/// A `j_sibling_val_t`'s folder and name.
+pub fn parse_sibling_val(v: &[u8]) -> Result<(u64, String)> {
+    let parent = u64_or_0(v, 0);
+    let len = v.get(8..10).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize).ok_or_else(|| corrupt("sibling-link record too short"))?;
+    let name = v.get(10..10 + len).ok_or_else(|| corrupt("sibling-link name runs past its record"))?;
+    Ok((parent, String::from_utf8_lossy(name.strip_suffix(&[0]).unwrap_or(name)).into_owned()))
+}
+
 pub fn dstream_id_key(stream: u64) -> Vec<u8> {
     hdr(stream, APFS_TYPE_DSTREAM_ID).to_vec()
 }
@@ -162,8 +191,14 @@ pub type Xfield = (u8, u8, Vec<u8>);
 
 /// Splits a `j_inode_val_t` into its fixed part and its extended fields.
 pub fn split_inode(v: &[u8]) -> Result<(Vec<u8>, Vec<Xfield>)> {
-    let fixed = v.get(..INODE_FIXED).ok_or_else(|| corrupt("inode record too short"))?.to_vec();
-    let blob = &v[INODE_FIXED..];
+    split_xfields(v, INODE_FIXED)
+}
+
+/// Splits a record value into its first `fixed` bytes and the extended
+/// fields (`xf_blob_t`) after them.
+pub fn split_xfields(v: &[u8], fixed: usize) -> Result<(Vec<u8>, Vec<Xfield>)> {
+    let blob = v.get(fixed..).ok_or_else(|| corrupt("record too short for its fixed part"))?;
+    let fixed = v[..fixed].to_vec();
     let mut fields = Vec::new();
     if blob.len() >= 4 {
         let n = u16::from_le_bytes([blob[0], blob[1]]) as usize;
@@ -260,8 +295,8 @@ fn u64_or_0(k: &[u8], off: usize) -> u64 {
 
 /// File-system key order: object id, record type, then per type: the
 /// hash-and-length word and name for hashed directory entries, the name for
-/// extended attributes, the logical offset for file extents. Missing parts
-/// of a search bound sort first.
+/// extended attributes, the logical offset for file extents, the sibling id
+/// for hard links' sibling records. Missing parts of a search bound sort first.
 pub fn key_cmp(a: &[u8], b: &[u8]) -> Ordering {
     let (ha, hb) = (u64_or_0(a, 0), u64_or_0(b, 0));
     let primary = (ha & OBJ_ID_MASK, ha >> 60).cmp(&(hb & OBJ_ID_MASK, hb >> 60));
@@ -274,7 +309,7 @@ pub fn key_cmp(a: &[u8], b: &[u8]) -> Ordering {
     match ha >> 60 {
         APFS_TYPE_DIR_REC => u32_or_0(a, 8).cmp(&u32_or_0(b, 8)).then_with(|| tail(a, 12).cmp(&tail(b, 12))),
         APFS_TYPE_XATTR => tail(a, 10).cmp(&tail(b, 10)),
-        APFS_TYPE_FILE_EXTENT => u64_or_0(a, 8).cmp(&u64_or_0(b, 8)),
+        APFS_TYPE_FILE_EXTENT | APFS_TYPE_SIBLING_LINK => u64_or_0(a, 8).cmp(&u64_or_0(b, 8)),
         _ => tail(a, 8).cmp(&tail(b, 8)),
     }
 }

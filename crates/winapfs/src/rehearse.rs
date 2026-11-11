@@ -47,6 +47,8 @@ pub fn run(src: &str, script: &str, vol: usize, part: Option<u32>, meta: Option<
     if !problems.is_empty() {
         return Err(CliError::new("not rehearsing: the blockers above come first"));
     }
+    println!("\n== names and links, before");
+    let links_before = crate::links::link_check_container(&c, "before")?;
 
     println!("\n== rehearsal: running {script} with writes kept in memory");
     let start = Instant::now();
@@ -66,6 +68,15 @@ pub fn run(src: &str, script: &str, vol: usize, part: Option<u32>, meta: Option<
     }
     if let Ok(v) = s.volume() {
         println!("  volume \"{}\" now: {} files, {} folders", v.sb.name, v.sb.num_files, v.sb.num_directories);
+    }
+    if result.is_ok() {
+        println!("\n== after the rehearsal");
+        summary(s.container())?;
+        crate::dump::space_check_container(s.container(), "  rehearsal result")?;
+        let links_after = crate::links::link_check_container(s.container(), "after")?;
+        if links_after > links_before {
+            return Err(CliError::new(format!("names and links: {links_before} problems before, {links_after} after")));
+        }
     }
     if let Some(dir) = meta {
         println!("\n== exporting metadata, after");
