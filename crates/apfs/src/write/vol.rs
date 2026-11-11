@@ -94,6 +94,28 @@ fn siblings(records: &[Entry]) -> Result<Vec<Sibling>> {
         .collect()
 }
 
+/// One extent-reference record (`j_phys_ext_key_t`, `j_phys_ext_val_t`):
+/// `len` blocks from `start`, used by `count` data streams.
+struct ExtentRef {
+    key: Vec<u8>,
+    start: u64,
+    len: u64,
+    count: i32,
+    val: Vec<u8>,
+}
+
+impl ExtentRef {
+    /// This record's value for `len` blocks used `count` times, with its
+    /// kind and owner kept.
+    fn val_with(&self, len: u64, count: i32) -> Vec<u8> {
+        let mut v = self.val.clone();
+        let kind = u64::from_le_bytes(v[0..8].try_into().unwrap()) & !fs::PEXT_LEN_MASK;
+        v[0..8].copy_from_slice(&(len | kind).to_le_bytes());
+        v[16..20].copy_from_slice(&count.to_le_bytes());
+        v
+    }
+}
+
 /// A name as an inode's name field stores it: NUL-terminated.
 fn name_z(name: &str) -> Vec<u8> {
     let mut z = name.as_bytes().to_vec();
@@ -336,21 +358,25 @@ impl<'a, 'c> VolEdit<'a, 'c> {
         if stream != id {
             records.extend(self.range(&fs::key_bound(stream), &fs::key_bound(stream + 1))?);
         }
-        // Every block the delete would release must be this file's alone.
+        // Every block the delete would release must have its references. A
+        // data stream other files share (a fresh clone's) is only left.
+        let shared = self.stream_users(stream)? > 1;
         let mut runs = match self.st.files.get(&id) {
             Some(f) => f.runs.iter().filter(|r| !r.fresh).map(|r| (r.phys, r.blocks)).collect(),
+            None if shared => Vec::new(),
             None => self.stream_runs(stream)?,
         };
         for (k, v) in &records {
             if fs::key_type(k) == fs::APFS_TYPE_XATTR {
                 let v = v.as_deref().unwrap_or_default();
-                if u16_at(v, 0)? & XATTR_DATA_STREAM != 0 {
-                    runs.extend(self.stream_runs(u64_at(v, 4)?)?);
+                let xstream = u64_at(v, 4).unwrap_or(0);
+                if u16_at(v, 0)? & XATTR_DATA_STREAM != 0 && self.stream_users(xstream)? <= 1 {
+                    runs.extend(self.stream_runs(xstream)?);
                 }
             }
         }
         for (phys, blocks) in runs {
-            self.extent_owner(phys, blocks)?;
+            self.extent_refs(phys, blocks)?;
         }
         Ok(())
     }
@@ -370,24 +396,31 @@ impl<'a, 'c> VolEdit<'a, 'c> {
         Ok(out)
     }
 
-    /// The extent reference covering `blocks` blocks from `phys`, as (key,
-    /// first block, length, owner), refused unless only one file uses them.
-    fn extent_owner(&mut self, phys: u64, blocks: u64) -> Result<(Vec<u8>, u64, u64, u64)> {
+    /// The extent references covering `blocks` blocks from `phys`, in
+    /// order. One file extent can span several: after a clone and its
+    /// original diverge, the shared and unshared parts have records of their own.
+    fn extent_refs(&mut self, phys: u64, blocks: u64) -> Result<Vec<ExtentRef>> {
         let rd = PhysReader(self.v.container());
         let x = self.extref()?;
-        let (k, v) = x
-            .floor(&rd, &fs::phys_ext_key(phys))?
-            .ok_or_else(|| corrupt(format!("no extent reference for block {phys:#x}")))?;
-        let v = v.ok_or_else(|| corrupt("extent reference without a value"))?;
-        let start = fs::key_id(&k);
-        let (rlen, owner, refcnt) = (u64_at(&v, 0)? & fs::PEXT_LEN_MASK, u64_at(&v, 8)?, u32_at(&v, 16)? as i32);
-        if start + rlen < phys + blocks {
-            return Err(corrupt(format!("blocks {phys:#x}+{blocks} are not covered by an extent reference")));
+        let end = phys + blocks;
+        let mut out = Vec::new();
+        let mut at = phys;
+        while at < end {
+            let (key, val) = x
+                .floor(&rd, &fs::phys_ext_key(at))?
+                .ok_or_else(|| corrupt(format!("no extent reference for block {at:#x}")))?;
+            let val = val.ok_or_else(|| corrupt("extent reference without a value"))?;
+            let r = ExtentRef { start: fs::key_id(&key), len: u64_at(&val, 0)? & fs::PEXT_LEN_MASK, count: u32_at(&val, 16)? as i32, key, val };
+            if r.start + r.len <= at {
+                return Err(corrupt(format!("blocks {at:#x} to {end:#x} are not covered by an extent reference")));
+            }
+            if r.count < 1 {
+                return Err(corrupt(format!("extent reference {:#x} has a count of {}", r.start, r.count)));
+            }
+            at = r.start + r.len;
+            out.push(r);
         }
-        if refcnt != 1 {
-            return Err(unsupported("changing data shared with clones or snapshots"));
-        }
-        Ok((k, start, rlen, owner))
+        Ok(out)
     }
 
     /// Removes the file or empty folder `name` from `dir`. A file with
@@ -409,11 +442,18 @@ impl<'a, 'c> VolEdit<'a, 'c> {
             return Err(unsupported(format!("deleting a file whose link count is {children_or_links}")));
         }
         let stream = u64_at(&raw, 8)?;
+        // A fresh clone and its original share one data stream: while
+        // another file uses it, it stays, one user fewer.
+        let users = self.stream_users(stream)?;
+        let shared = users > 1;
         // Everything keyed by the inode (and its data stream) goes, sibling
         // links included if the file once had several names.
         let mut records = self.range(&fs::key_bound(id), &fs::key_bound(id + 1))?;
         let links = siblings(&records)?;
-        if stream != id {
+        if shared {
+            let of_stream = |k: &[u8]| fs::key_id(k) == stream && matches!(fs::key_type(k), fs::APFS_TYPE_DSTREAM_ID | fs::APFS_TYPE_FILE_EXTENT);
+            records.retain(|(k, _)| !of_stream(k));
+        } else if stream != id {
             records.extend(self.range(&fs::key_bound(stream), &fs::key_bound(stream + 1))?);
         }
 
@@ -422,14 +462,16 @@ impl<'a, 'c> VolEdit<'a, 'c> {
             self.remove(&fs::sibling_map_key(s.id))?;
         }
         self.touch_folder(dir, -1, now)?;
-        self.drop_file_data(t, id, stream)?;
+        if shared {
+            self.put(fs::dstream_id_key(stream), fs::dstream_id_val(users - 1))?;
+        } else {
+            self.drop_file_data(t, id, stream)?;
+        }
         for (k, v) in records {
             if fs::key_type(&k) == fs::APFS_TYPE_XATTR {
                 let v = v.unwrap_or_default();
                 if u16_at(&v, 0)? & XATTR_DATA_STREAM != 0 {
-                    let xstream = u64_at(&v, 4)?;
-                    self.drop_extents(t, xstream)?;
-                    self.remove(&fs::dstream_id_key(xstream))?;
+                    self.leave_stream(t, u64_at(&v, 4)?)?;
                 }
             }
             // File extents were removed with the data.
@@ -582,7 +624,52 @@ impl<'a, 'c> VolEdit<'a, 'c> {
         Ok(())
     }
 
-    /// The block map of file `id`, loaded from its extent records on first use.
+    /// How many files use data stream `stream` (`j_dstream_id_val_t`): more
+    /// than one for a fresh clone and its original; 0 if it has no record.
+    fn stream_users(&mut self, stream: u64) -> Result<u32> {
+        self.get(&fs::dstream_id_key(stream))?.map_or(Ok(0), |v| u32_at(&v, 0))
+    }
+
+    /// Gives file `id` a data stream of its own before its data changes. A
+    /// fresh clone shares its original's stream, so writing through it would
+    /// change both files. The new stream lists the same extents, so each of
+    /// their blocks gains a user, and the shared stream loses one. Returns
+    /// the new stream's id.
+    fn unshare(&mut self, id: u64, stream: u64, users: u32) -> Result<u64> {
+        let new = self.take_id()?;
+        let bs = self.bs();
+        let (lo, hi) = fs::file_extent_range(stream);
+        for (k, v) in self.range(&lo, &hi)? {
+            let v = v.ok_or_else(|| corrupt("file extent without a value"))?;
+            let (len, phys) = (u64_at(&v, 0)? & fs::FILE_EXTENT_LEN_MASK, u64_at(&v, 8)?);
+            if phys != 0 {
+                self.count_users(phys, len.div_ceil(bs), 1)?;
+            }
+            self.put(fs::file_extent_key(new, u64_at(&k, 8)?), v)?;
+        }
+        self.put(fs::dstream_id_key(stream), fs::dstream_id_val(users - 1))?;
+        self.put(fs::dstream_id_key(new), fs::dstream_id_val(1))?;
+        let mut raw = self.inode_raw(id)?;
+        put_u64(&mut raw, 8, new); // private_id
+        self.put(fs::inode_key(id), raw)?;
+        Ok(new)
+    }
+
+    /// One file stops using data stream `stream` (of an extended attribute):
+    /// if others share it, its count drops; otherwise its blocks are
+    /// released and its records go.
+    fn leave_stream(&mut self, t: &mut Txn, stream: u64) -> Result<()> {
+        let users = self.stream_users(stream)?;
+        if users > 1 {
+            return self.put(fs::dstream_id_key(stream), fs::dstream_id_val(users - 1));
+        }
+        self.drop_extents(t, stream)?;
+        self.remove(&fs::dstream_id_key(stream))?;
+        Ok(())
+    }
+
+    /// The block map of file `id`, loaded from its extent records on first
+    /// use, with a data stream of its own (see [`VolEdit::unshare`]).
     fn file(&mut self, id: u64) -> Result<&mut FileState> {
         if !self.st.files.contains_key(&id) {
             let raw = self.inode_raw(id)?;
@@ -592,7 +679,11 @@ impl<'a, 'c> VolEdit<'a, 'c> {
             if u32_at(&raw, 68)? & fs::UF_COMPRESSED != 0 {
                 return Err(unsupported("changing compressed files"));
             }
-            let stream = u64_at(&raw, 8)?;
+            let mut stream = u64_at(&raw, 8)?;
+            let users = self.stream_users(stream)?;
+            if users > 1 {
+                stream = self.unshare(id, stream, users)?;
+            }
             let (_, fields) = fs::split_inode(&raw)?;
             let (size, written) = match fields.iter().find(|f| f.0 == fs::INO_EXT_TYPE_DSTREAM) {
                 Some(d) => (u64_at(&d.2, 0)?, u64_at(&d.2, 24)?),
@@ -966,23 +1057,45 @@ impl<'a, 'c> VolEdit<'a, 'c> {
         Ok(())
     }
 
-    /// Frees `blocks` blocks from `phys` and takes them out of the
-    /// extent-reference tree, splitting a record that covers more.
+    /// Lets go of `blocks` blocks from `phys`, which one data stream stops
+    /// using: every extent reference over them loses one count. Blocks only
+    /// this stream used (a count of one) are freed; blocks it shares with
+    /// clones stay with them. A reference reaching past the range is split,
+    /// and the parts outside keep their count.
     fn release_extent(&mut self, t: &mut Txn, phys: u64, blocks: u64) -> Result<()> {
-        let (k, start, rlen, owner) = self.extent_owner(phys, blocks)?;
+        for (s, n) in self.count_users(phys, blocks, -1)? {
+            t.space.free_run(s, n);
+            self.st.data_freed += n;
+        }
+        Ok(())
+    }
+
+    /// Adds `delta` (one more or one fewer data stream) to the count of
+    /// every extent reference over `blocks` blocks from `phys`. References
+    /// reaching past the range are split, and the parts outside keep their
+    /// count. Returns the runs whose count reached zero: their references
+    /// are gone, and the caller frees them.
+    fn count_users(&mut self, phys: u64, blocks: u64, delta: i32) -> Result<Vec<(u64, u64)>> {
+        let end = phys + blocks;
+        let refs = self.extent_refs(phys, blocks)?;
         let rd = PhysReader(self.v.container());
         let x = self.extref()?;
-        x.remove(&rd, &k)?;
-        if start < phys {
-            x.upsert(&rd, fs::phys_ext_key(start), Some(fs::phys_ext_val(phys - start, owner, 1)))?;
+        let mut unused = Vec::new();
+        for r in refs {
+            let (s, e, r_end) = (r.start.max(phys), (r.start + r.len).min(end), r.start + r.len);
+            x.remove(&rd, &r.key)?;
+            if r.start < s {
+                x.upsert(&rd, fs::phys_ext_key(r.start), Some(r.val_with(s - r.start, r.count)))?;
+            }
+            if e < r_end {
+                x.upsert(&rd, fs::phys_ext_key(e), Some(r.val_with(r_end - e, r.count)))?;
+            }
+            match r.count + delta {
+                0 => unused.push((s, e - s)),
+                count => x.upsert(&rd, fs::phys_ext_key(s), Some(r.val_with(e - s, count)))?,
+            }
         }
-        if phys + blocks < start + rlen {
-            let rest = start + rlen - phys - blocks;
-            x.upsert(&rd, fs::phys_ext_key(phys + blocks), Some(fs::phys_ext_val(rest, owner, 1)))?;
-        }
-        t.space.free_run(phys, blocks);
-        self.st.data_freed += blocks;
-        Ok(())
+        Ok(unused)
     }
 }
 

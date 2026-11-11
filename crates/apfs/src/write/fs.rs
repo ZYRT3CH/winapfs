@@ -10,8 +10,8 @@ const APFS_TYPE_EXTENT: u64 = 2;
 const APFS_TYPE_INODE: u64 = 3;
 pub const APFS_TYPE_XATTR: u64 = 4;
 pub const APFS_TYPE_SIBLING_LINK: u64 = 5;
-const APFS_TYPE_DSTREAM_ID: u64 = 6;
-const APFS_TYPE_FILE_EXTENT: u64 = 8;
+pub const APFS_TYPE_DSTREAM_ID: u64 = 6;
+pub const APFS_TYPE_FILE_EXTENT: u64 = 8;
 pub const APFS_TYPE_DIR_REC: u64 = 9;
 const APFS_TYPE_SIBLING_MAP: u64 = 12;
 

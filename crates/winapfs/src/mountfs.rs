@@ -388,6 +388,25 @@ impl Fs {
     }
 
     /// The folder a new name goes into, and the name in Mac form.
+    /// Refuses deleting `path` (details `meta`) if it cannot be deleted.
+    /// Asked when a delete is requested (at open, or by setting the delete
+    /// disposition), where Windows can still report it: the delete itself
+    /// happens at cleanup, which cannot report errors, so a refusal found
+    /// only there looks like a delete that worked.
+    fn delete_refusal(&self, path: Option<&[u16]>, meta: &Meta) -> Result<(), NTSTATUS> {
+        if !self.writable || self.backend.refuses_changes() {
+            return Err(STATUS_MEDIA_WRITE_PROTECTED);
+        }
+        if meta.is_dir && !self.backend.list(meta.id)?.is_empty() {
+            return Err(STATUS_DIRECTORY_NOT_EMPTY);
+        }
+        if let Some(path) = path {
+            let (dir, mac) = self.parent_and_name(path)?;
+            self.backend.check_remove(dir, &mac)?;
+        }
+        Ok(())
+    }
+
     fn parent_and_name(&self, path: &[u16]) -> Result<(u64, String), NTSTATUS> {
         let (dir, leaf) = split_path(path);
         let (_, meta, _) = self.resolve(dir)?;
@@ -511,6 +530,10 @@ unsafe extern "system" fn open(
         }
         if create_options & FILE_NON_DIRECTORY_FILE != 0 && meta.is_dir {
             return Err(STATUS_FILE_IS_A_DIRECTORY);
+        }
+        // Explorer often asks for the delete as it opens the file.
+        if create_options & FILE_DELETE_ON_CLOSE != 0 {
+            me.delete_refusal(Some(path), &meta)?;
         }
         let h = me.new_handle(meta, parent, last_is_dot(path));
         *file_info = me.handle_info(&h);
@@ -757,20 +780,8 @@ unsafe extern "system" fn set_file_size(
 unsafe extern "system" fn can_delete(fs: *mut FileSystem, file_context: *mut c_void, name: *const u16) -> NTSTATUS {
     guard(|| {
         let me = this(fs);
-        // The delete itself happens at cleanup, which cannot report errors:
-        // refuse here, or Explorer shows the file as deleted and it stays.
-        if !me.writable || me.backend.refuses_changes() {
-            return Err(STATUS_MEDIA_WRITE_PROTECTED);
-        }
         let meta = handle(file_context).meta();
-        if meta.is_dir && !me.backend.list(meta.id)?.is_empty() {
-            return Err(STATUS_DIRECTORY_NOT_EMPTY);
-        }
-        if !name.is_null() {
-            let (dir, mac) = me.parent_and_name(wstr(name))?;
-            me.backend.check_remove(dir, &mac)?;
-        }
-        Ok(())
+        me.delete_refusal((!name.is_null()).then(|| wstr(name)), &meta)
     })
 }
 
